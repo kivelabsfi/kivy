@@ -10,6 +10,65 @@ Security:
   - binds 127.0.0.1; reached only through the cloudflared tunnel; runs as user `kivy`, sandboxed
   - caps: $20 per swap / send / lend; perps uncapped (2026-10-18)
 """
+# ════════════════════════════════════════════════════════════════════════════════════════════════════════════
+# site/server.py — Kivy's web server (service kivy-site, port 8772, localhost only; Cloudflare tunnel in front).
+# Plain Python stdlib (http.server + threads), no framework. Run: `python3 site/server.py` (systemd runs it).
+# It serves the page (site/index.html, or index.min.html from tools/build_page.py), answers chat, reads the chain,
+# and asks the local TypeScript builder (builder/builder.ts, service kivy-lend, port 8799) to build transactions (PTBs).
+# It never holds a key: the user's own wallet signs everything.
+#
+# Main request flow (one chat message -> a card -> a signed transaction -> check 2):
+#
+#   page (index.html) ──POST /api/chat──> Handler._do_POST
+#        │                                   │  looks_secret / tidy_* / not_english
+#        │                                   ├─> typo_chain / intent_ask       (typos, unclear job or coin: ask with choices)
+#        │                                   ├─> widget_reply  (exact rules, live data -> text + card)   ← most messages end here
+#        │                                   │     quick_answers → journey_answers → situations → xw_parse → send_reply
+#        │                                   │     → perps (parse_trade, perp_manage) → chain_parse → lending cards …
+#        │                                   └─> ai_reply → brain.py (only when no rule fits; tools run by Kivy's own code)
+#        │                                         └─> reply()  (rule fallback when the AI is off or busy)
+#        │ user taps Approve on a card
+#        ├──POST /api/tx/<kind>──> validate again ─> lend_cli / lend_post ─> builder/builder.ts builds the tx
+#        │                         _send(): + Kivy fee, guard, remember_intent (plan saved), pkg_watch (allowlist)
+#        │   check 1 runs IN THE BROWSER (simulate + compare with the guard) before the wallet opens
+#        ├──wallet signs──> POST /api/tx/log ─> kivy_diary_add + verify_later ─> check_tx  (= check 2: chain vs plan)
+#        │                                       -> data/checks.jsonl, metrics.pipe/ptb, the Kivy diary line ✅ / ⚠️
+#        └──POST /api/pipeline  (check-1 and signing results for the stats pipeline)
+#
+# Outside links: knowledge/kivy.json (K(): coins, texts, caps, fees, GraphQL URLs) · brain.py (the AI) · accounts.py
+# (wallet sign-in, chats, Terms) · metrics.py (numbers for kivystats) · kivy_pkgs.json (Move package allowlist) ·
+# Sui GraphQL (+ gRPC via builder.ts as backup) · Aftermath (perps, router, prices) · Bluefin tickers · Tatum prices ·
+# DeepBook indexer / GeckoTerminal (spot charts). Files in the data folder: intents.db, checks.jsonl, unknown_pkgs.log,
+# admins.txt, public_stats.on (+ the kivystats access token). tools/watchdog.py alerts on the 'kivy …' log lines printed here;
+# walrus/export_records.py and tools/report_checks.py read checks.jsonl.
+#
+# Section index (top to bottom; line numbers are where each "Section n" banner sits, approximate after edits):
+#   1  setup, session secret, knowledge folder + brain.py loader                                (~71)
+#   2  AI budget and per-IP abuse limits                                                        (~128)
+#   3  chat patterns: lending / claim / withdraw / perps                                        (~211)
+#   4  perps on Aftermath: markets, charts, account, spot swap card, trade reader, perps math   (~236)
+#   5  user journeys: exit, best rate, activity, totals, earnings, common questions             (~924)
+#   6  more situations: staked SUI, dust, claim, input tidying, seed guard, quick answers        (~1380)
+#   7  widget_reply — the main code-first dispatcher                                            (~1983)
+#   8  wallet memory + Activity labels                                                          (~2476)
+#   9  intent: job -> coin -> market, clarifying questions, wallet snapshot                      (~2582)
+#  10  AI answers (brain.py) with Kivy-run tools                                                (~3023)
+#  11  plans + check 2: IntentStore, remember_intent, check_tx, verify_later, Kivy diary         (~3385)
+#  12  config helpers: names, $ cap, K(), login tokens                                          (~4143)
+#  13  prices, coins, balances, guard, chain reads (GraphQL / gRPC backup)                      (~4205)
+#  14  rule-based reply() fallback, FAQ, recipients / SuiNS, gasless                            (~4579)
+#  15  lending: markets, builder.ts reads, rates, positions, lend card                             (~4758)
+#  16  move: withdraw + swap + lend in one tx                                                   (~5150)
+#  17  chains: several steps in one tx (chain_parse and friends)                                (~5229)
+#  18  builder POSTs, withdraw cards, plan(), multi-send                                        (~6298)
+#  19  tx detail, fees, swap router, spot charts, order books                                   (~6634)
+#  20  markets by name, sends, cross-account requests                                           (~7005)
+#  21  market overview, warm-up thread, login page, request limits, admin list, CSP             (~7581)
+#  22  Handler: plumbing, _send, GET routes, POST routes                                        (~7716)
+#  23  cache sweeper + main                                                                     (~9298)
+# ════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+# ── Section 1: setup — imports, port, login secret, the Kivy folder and its brain; read at import by everything below ──
 import difflib
 import base64
 import hashlib
@@ -66,6 +125,7 @@ except Exception as _exc:          # no brain -> rule-based replies only
     print('kivy: AI brain unavailable (%s)' % _exc, flush=True)
     BRAIN = None
 
+# ── Section 2: AI budget + abuse limits — per minute / day / visitor / real IP; used by _ai_reply and Handler._heavy ──
 _RATE = []                         # timestamps of AI calls, a simple per-minute budget
 AI_PER_MIN = int(os.environ.get('KIVY_AI_PER_MIN', 60))          # everyone together (was 12: a busy minute sent every user the help menu, 2026-10-23)
 AI_PER_VISITOR_MIN = int(os.environ.get('KIVY_AI_PER_VISITOR_MIN', 10))   # one visitor can't use up everyone's share
@@ -84,7 +144,7 @@ _LIMIT_SEEN = {}
 
 
 def limit_hit(kind, ip):
-    """One log line per address and kind every 10 minutes when a limit stops someone — kivy_watch alerts on these."""
+    """One log line per address and kind every 10 minutes when a limit stops someone — watchdog alerts on these."""
     k, now = (kind, ip), time.time()
     if now - _LIMIT_SEEN.get(k, 0) > 600:
         _LIMIT_SEEN[k] = now
@@ -93,6 +153,7 @@ def limit_hit(kind, ip):
         print('kivy limit: %s stopped for %s' % (kind, re.sub(r'(\d+)\.(\d+)$', 'x.x', str(ip))), flush=True)   # the address shortened
 
 
+# The limit check every route uses (Handler._heavy, /api/chat, /api/tx/log, /api/feedback, _ai_reply); logs when it stops someone.
 def ip_quota(kind, ip, key=None):
     ok = _ip_quota(kind, ip, key)
     if not ok:
@@ -147,6 +208,8 @@ AI_BUSY = "I'm getting a lot of questions right now — ask me again in a moment
 PUBLIC = os.environ.get('KIVY_PUBLIC', '1') == '1'   # open to everyone; set KIVY_PUBLIC=0 to lock it again
 
 
+# ── Section 3: chat patterns — exact sentence shapes for lending tables, rewards/claim, withdraw, perps deposit/withdraw;
+#    read by widget_reply / perp_widget (more patterns sit next to the functions that use them) ──
 LEND_ASK_RE = re.compile(r'\b(?:differen\w*|safe\w*|risk\w*|why|vs|versus|which\s+is\s+better|collateral|liquidat\w*|bad\s+debt)\b', re.I)   # not 'explain': "explain APR vs APY" is a lesson
 MARKETS_RE = re.compile(r"^\s*(?:i\s+want\s+to\s+|let'?s\s+|can\s+i\s+)?(?:lend|lending|earn|yield|deposit|supply)(?:\s+(?:my\s+)?usdc)?\s*[?.!]*\s*$|\blending\s+(markets?|rates?|options?|yields?)\b|\bwhere\s+(can|should|do)\s+i\s+lend\b|\bcompare\s+(lending|yields?|rates?)\b|\bbest\s+(lending\s+)?(yield|rate|apy|apr)\b", re.I)
 
@@ -170,6 +233,8 @@ PERP_WD_RE = re.compile(r'^\s*(?:withdraw|take\s+out|remove|pull)(?:\s+(\d+(?:\.
 _PERP = {}
 
 
+# ── Section 4: perps on Aftermath — markets, charts, the perps account, trade sentences and perps math. Reads aftermath.finance
+#    REST directly; wallet-specific perps data and every perps transaction go through builder.ts (lend_cli 'perp-*') ──
 # ── live charts: Aftermath perps candles (crypto, stocks, indexes, gold/oil) ──
 _MK = {'t': 0, 'v': {}}
 _CANDLES = {}
@@ -180,6 +245,7 @@ CHART_ALIASES = {'XBTC': 'BTC', 'GOLD': 'XAUT', 'XAU': 'XAUT', 'SILVER': 'XAG', 
                  'ETHEREUM': 'ETH', 'SOLANA': 'SOL', 'XBTC': 'BTC'}
 
 
+# {SYMBOL: market object id} for every Aftermath perps market (cached 1 h); the key every perps call starts from.
 def af_markets():
     if time.time() - _MK['t'] < 3600 and _MK['v']:
         return _MK['v']
@@ -198,6 +264,7 @@ TRADFI_GROUPS = {'Indexes': {'US500', 'US100', 'JP225', 'KR200', 'INDIA50'},
                  'FX': {'USDKRW', 'USDBRL'}}
 
 
+# The picker's tab for a market: Crypto, Stocks, Indexes, Commodities or FX.
 def market_group(sym, category):
     if category != 'TradFi':
         return category
@@ -211,6 +278,7 @@ _MKMETA = {'t': 0, 'v': {}}
 _MKSTATS = {'t': 0, 'v': []}
 
 
+# POST to Aftermath's public perps API (markets, 24h stats, prices); no key.
 def af_post(path, body):
     req = urllib.request.Request('https://aftermath.finance/api/perpetuals/' + path, data=json.dumps(body).encode(),
                                  headers={'Content-Type': 'application/json', 'User-Agent': 'kivy'})
@@ -257,6 +325,7 @@ def perp_market_list(fresh=False):
     return rows
 
 
+# A typed name ('gold', 'tesla', 'btc') -> the perps market symbol, or None; used by every chart/perps route and reader.
 def chart_symbol(word):
     w = re.sub(r'[^A-Za-z0-9&]', '', str(word or '')).upper()
     w = CHART_ALIASES.get(w, w)
@@ -294,6 +363,7 @@ def stale_ok(store, key, ttl, fn, max_age=300):
     return v
 
 
+# Chart candles for GET /api/chart: cached 5 s, refreshed in the background (stale_ok).
 def candles(symbol, tf):
     return stale_ok(_CANDLES, (symbol, tf), 5, lambda: _candles(symbol, tf))
 
@@ -311,6 +381,7 @@ CHART_RE = re.compile(r'^\s*(?:show\s+(?:me\s+)?(?:the\s+|a\s+)?)?(?:live\s+)?(?
                       r'|^\s*([A-Za-z0-9&]{2,12})\s+(?:live\s+)?(?:price\s+)?chart\s*[?.!]*\s*$', re.I)
 
 
+# The wallet's Aftermath perps account (has one? free collateral) via builder.ts 'perp-account'; cached 15 s.
 def perp_account(addr, fresh=False):
     hit = _PERP.get(addr)
     if hit and not fresh and time.time() - hit[0] < 15:
@@ -320,6 +391,8 @@ def perp_account(addr, fresh=False):
     return v
 
 
+# 'perps', 'deposit 5 to perps', 'withdraw all from aftermath' -> the perps account card (open / deposit / withdraw);
+# called near the end of widget_reply. The card's button posts to /api/tx/perp.
 def perp_widget(msg, address):
     dm, wm = PERP_DEP_RE.match(msg), PERP_WD_RE.match(msg)
     if not (PERP_RE.match(msg) or dm or wm):
@@ -390,6 +463,8 @@ TRADE_ASK_RE = re.compile(r"^\s*(?:i\s+)?(?:wanna|want\s+to|would\s+like\s+to|'?
 SPOT_ASK_RE = re.compile(r'^\s*(?:swap|buy|get)\s+(?:some\s+)?(?:([A-Za-z]{2,8})\s+(?:to|for|into)\s+)?([A-Za-z]{2,10})\s*(?:on\s+spot)?\s*[?.!]*\s*$', re.I)
 
 
+# 'buy sui', 'sell wal', bare 'swap': the spot swap card (Aftermath router quote); called by widget_reply and /api/market/view.
+# The card's button posts to /api/tx/swap.
 def spot_ask(msg, address):
     bare = bool(re.match(r'^\s*swap\s*[?.!]*\s*$', msg, re.I))
     if bare:                                         # bare "swap" (the menu / Swap button): USDC on top, SUI below — the user picks (2026-10-21)
@@ -727,11 +802,13 @@ def perp_solve(prm, side, margin, price=0, usd=0, qty=0, liq=0, lev=0):
                 borrowed=round(max(0.0, N - m), 2), liq_est=liq_of(L), fee=round(N * f, 6))
 
 
+# Price text for cards: 2 decimals above $100, 4 above $1, else 6 significant digits.
 def fmt_px(x):
     x = float(x)
     return '{:,.2f}'.format(x) if x >= 100 else '{:,.4f}'.format(x) if x >= 1 else '{:.6g}'.format(x)
 
 
+# A plain number for chat text and card asks: up to 6 decimals, trailing zeros cut.
 def num_plain(x):
     return ('%.6f' % float(x)).rstrip('0').rstrip('.')
 
@@ -844,6 +921,8 @@ BANK_RE = re.compile(r'\b(?:bank(?:\s+account)?|iban|swift|paypal|venmo|revolut|
 FUNDING_Q_RE = re.compile(r'\bfunding(?:\s+rate)?s?\b', re.I)
 
 
+# ── Section 5: user journeys — whole-wallet questions answered from live data, no AI; entry point journey_answers(),
+#    called by widget_reply. Reads builder.ts (positions, perps), Sui GraphQL (activity), lend_rates_all ──
 # ── User journeys answered by Kivy itself (2026-10-24, user-scenario review: these all went to the AI with little data) ──
 # 1 exit everything · 2 best rate / move to the best market (every coin) · 3 activity + earnings · 4 common questions by code
 EXIT_RE = re.compile(r"^\s*(?:please\s+)?(?:(?:get|take)\s+me\s+out(?:\s+of)?(?:\s+(?:everything|it\s+all|all(?:\s+of\s+it)?|all\s+my\s+positions|my\s+positions|this))?"
@@ -1001,6 +1080,7 @@ def recent_activity(address, n=10):
     return out
 
 
+# 'what did I do lately', 'my last transactions': the wallet's recent transactions as plain lines (journey_answers).
 def activity_reply(msg, address):
     if not address:
         return {'text': K()['no_wallet']}
@@ -1155,6 +1235,7 @@ COMMON_QS = [
 ]
 
 
+# The COMMON_QS table above: fixed answers (greetings, fees, safety, undo, help …); '@fees' / '@help' / '@assets' are filled live.
 def common_answer(msg):
     for pat, ans in COMMON_QS:
         if re.search(pat, msg, re.I):
@@ -1200,6 +1281,7 @@ def amount_followup(msg, address, history):
     return widget_reply(new, address, hs[:last])
 
 
+# Section 5's entry point, called by widget_reply right after quick_answers: picks the journey whose pattern matches.
 def journey_answers(msg, address):
     if EXIT_RE.match(msg):
         return exit_reply(address)
@@ -1295,6 +1377,8 @@ def choose_icons(w):
     return w
 
 
+# ── Section 6: more situations + input hygiene — staked SUI, dust sweep, claim card, amount/wording tidying, seed-phrase
+#    guard, quick_answers; situations() and quick_answers() are called by widget_reply, tidy_*/looks_secret by /api/chat ──
 # ── More situations, answered by Kivy itself (2026-10-24 "think about new more situations", 30-case review) ──
 # Most rewrite the message into a form Kivy already builds and checks (one approval where the builder allows it);
 # the rest are honest answers. Rebalance / gather / dollar + "except" amounts / one coin into several / several into one /
@@ -1339,6 +1423,7 @@ def staked_line(ranked, where=None):
     return '%s pays the most of the %d staked SUI Kivy can lend%s (%s a year).' % (seen[0][0], len(seen), ' on ' + where if where else '', rates)
 
 
+# The market a piece of text names (chain_market's reading), or None for 'best' / 'there' / nothing.
 def _mk_of(text):
     k, _ = chain_market(text or '')
     return k if k and k not in ('best', 'there') else None
@@ -1558,6 +1643,8 @@ def dust_reply(msg, address):
     return r
 
 
+# Section 6's entry point (called by widget_reply): dust, advice questions, staked SUI, rebalance, gather, splits …
+# Returns an answer, None, or {'_rewrite': simpler sentence, '_say': note} that widget_reply reads again once.
 def situations(msg, address):
     low = msg.lower()
     try:
@@ -1893,6 +1980,10 @@ def quick_answers(msg, address):
     return None
 
 
+# ── Section 7: widget_reply — the main code-first dispatcher ──
+# Tries every exact reader in a fixed order and returns the first answer ({'text', 'widget'?, 'plan'?}), or None so the
+# AI takes over. Called by POST /api/chat (and recursively for rewrites); tests call it directly (tests/test_*.py).
+# Order matters: earlier readers win, so a new reader goes where it can't steal a message meant for a later one.
 def widget_reply(msg, address, history=None):
     qa = quick_answers(msg, address)
     if qa:
@@ -2197,6 +2288,7 @@ def widget_reply(msg, address, history=None):
     pw = perp_widget(msg, address)
     if pw is not None:
         return pw
+    # from here on: lending readers — swap-then-lend, 'lend X on Y', move, withdraw, lending tables, claim, a bare market name
     """Buttons-and-slider answers for lending; built from live data, no AI needed."""
     if re.match(r'^\s*(?:about\s+)?volo(?:\s+vaults?)?\s*[?.!]*\s*$', msg, re.I):
         return {'text': 'Volo vaults (NAVI\'s sister protocol — the BTC vaults and outside-curator vaults like Stable Curator #1) are shown '
@@ -2381,6 +2473,8 @@ def widget_reply(msg, address, history=None):
     return None
 
 
+# ── Section 8: wallet memory + Activity labels — read back from Kivy's diary and the chain, never stored per user;
+#    used by GET /api/tx/labels, GET /api/memory and the AI's prompt ──
 def tx_labels(digests, owner=None):
     """{digest: what Kivy called it} from Kivy's own transaction log. Public: the transactions are public on chain and every
     Kivy transaction pays Kivy's fee on chain, so these labels reveal nothing new (2026-10-22). owner: only that sender's."""
@@ -2485,6 +2579,8 @@ def welcome_line(m):
     return ('Welcome back. ' + ' '.join(bits)) if bits else ''
 
 
+# ── Section 9: intent — which job, coin and market a message means; asks with tappable choices when more than one fits.
+#    intent_ask() is called by /api/chat and widget_reply; wallet_snapshot() feeds the AI prompt ──
 # ── What does the user mean? job -> coin -> market; ask when more than one fits (2026-10-20) ──
 # Runs after the exact command patterns and before the AI. Typos are forgiven ("witdraw", "usdsiu"), and a message
 # that names a coin but no job (or two jobs) gets tappable choices built from the user's own wallet.
@@ -2843,6 +2939,7 @@ def latest_digest(address):
         return ''
 
 
+# The newest transaction digest mentioned in this chat (for the AI's get_transaction tool).
 def last_digest(history):
     for h in reversed(history or []):
         m = re.search(r'transaction ([1-9A-HJ-NP-Za-km-z]{32,44})', str((h or {}).get('text') or ''))
@@ -2923,6 +3020,8 @@ def plain_command(msg):
     return None
 
 
+# ── Section 10: AI answers — brain.py's chat() with tools that Kivy's own functions run (prices, balances, cards).
+#    Only reached from /api/chat when widget_reply and intent_ask return None; budgeted by Section 2 limits ──
 def ai_reply(msg, history, address=None):
     """The AI's answer, with one guard: it may never say a transaction is planned or ready to approve unless a real card
     came with it — approval buttons only ever come from Kivy's own cards (2026-10-21: "nothing happened")."""
@@ -3158,6 +3257,8 @@ def _ai_reply(msg, history, address=None):
         _h['widget'] = {'type': 'choose', 'options': opts}
         return {'shown': len(opts), 'note': 'The options are shown as buttons under your reply; ask the question in one line and do not list them again.'}
 
+    # The tools brain.py offers the model (names and descriptions are defined in brain.py's tool list); each one runs
+    # Kivy's own code here, so the AI never builds a transaction itself — plan_* and show_card return Kivy's cards.
     tools = {
         'ask_choice': ask_choice,
         'get_balances': (lambda a: {'note': 'The wallet IS connected, but the user turned off "Let the AI see my wallet" in Settings › Privacy. '
@@ -3238,6 +3339,7 @@ def _ai_reply(msg, history, address=None):
                 tools.pop('get_balances', None)          # the snapshot IS the balance: no second AI round to fetch it again (W-01)
             except Exception:
                 pass
+        # brain.py: one model call with these tools; returns {'text', 'plan'?} or None
         out = BRAIN.chat(msg, history, k, tools, wallet_connected=bool(address), allow=address or '')
         url = (_h.get('tx') or {}).get('explorer')
         if out and url and url not in (out.get('text') or ''):
@@ -3280,6 +3382,8 @@ KIVY_DIARY = KIVY_HOME / 'diary.md'
 _DIARY_SEEN = set()
 
 
+# ── Section 11: plans and check 2 — every built transaction's plan is saved (IntentStore), then compared with the landed
+#    transaction (check_tx via builder.ts 'tx-facts'). Fed by Handler._send (remember_intent) and POST /api/tx/log (verify_later) ──
 # ── After-the-fact check: did the signed transaction do what Kivy's card promised? (2026-10-20) ──
 # When Kivy builds a transaction the SERVER remembers its plan (the same limits the pre-sign check uses, plus the
 # minimum the user should receive). After signing, the browser only hands back the digest and the plan's id; the
@@ -3290,6 +3394,7 @@ class IntentStore(dict):
     Changing a field of a stored plan needs .save(iid)."""
     DB = HERE / 'data' / 'intents.db'
 
+    # Loads the last 2 h of plans from data/intents.db (sqlite) at start-up.
     def __init__(self):
         super().__init__()
         self._lock = threading.Lock()
@@ -3320,6 +3425,7 @@ class IntentStore(dict):
         if it is not None:
             self._db('INSERT OR REPLACE INTO intents(iid, at, data) VALUES(?,?,?)', (iid, float(it.get('at') or time.time()), json.dumps(it, default=str)))
 
+    # Memory first; a plan older than 2 h (or lost in a restart) is read back from disk for up to 24 h.
     def get(self, iid, default=None):
         it = dict.get(self, iid)
         if it is None and re.match(r'^[0-9a-f]{16}$', str(iid or '')):
@@ -3339,6 +3445,7 @@ TX_BUILD = {'/api/tx/dust', '/api/tx/swap', '/api/tx/check-send', '/api/tx/sendm
 OTHER_SHARE_MAX = 0.01                                # others (pools, protocol fee wallets) may get at most 1% of what was paid
 
 
+# Called by Handler._send (Kivy's fee applies only to 2+ actions) and remember_intent (metrics: the PTB's steps).
 def intent_actions(path, req, resp):
     """The steps of a transaction Kivy built, for the numbers: [{service, coin, amount, usd}] (one PTB can hold several)."""
     def act(service, coin, amount):
@@ -3425,6 +3532,7 @@ def intent_actions(path, req, resp):
 KIVY_PKGS_FILE = Path('/opt/kivy/kivy_pkgs.json')   # the Move packages a Kivy transaction may call (audit V01); the page enforces the same list
 
 
+# The allowlisted Move package ids from kivy_pkgs.json, normalised; read by pkg_watch on every build.
 def kivy_pkgs():
     try:
         return {normaddr(p) for p in json.loads(KIVY_PKGS_FILE.read_text())['packages']}
@@ -3432,6 +3540,7 @@ def kivy_pkgs():
         return set()
 
 
+# '0x2' -> the full 64-hex form, so ids compare equal however they were written.
 def normaddr(a):
     try:
         return '0x%064x' % int(str(a), 16)
@@ -3463,6 +3572,7 @@ def pkg_watch(path, tx):
     return bad
 
 
+# Called by remember_intent; the label ends up in the Kivy diary line and the Activity tab (GET /api/tx/labels).
 def intent_label(path, req, resp):
     """What the Activity tab calls a transaction, written by Kivy from the plan it built — never text from the request
     (red-team 2026-10-24: /api/tx/log took any label, so anyone could write into a user's Activity, greeting and AI notes).
@@ -3522,6 +3632,7 @@ def intent_label(path, req, resp):
     return k
 
 
+# Called by Handler._send for every successful POST /api/tx/* build; the id goes back to the page as intent_id / guard.iid.
 def remember_intent(path, req, resp):
     """Store the plan behind a transaction Kivy just built; returns its id (kept 2 hours)."""
     now = time.time()
@@ -3628,10 +3739,12 @@ def remember_intent(path, req, resp):
     return iid                                        # signer beat it on the first live test (2026-10-25); after 5 s it carries on alone
 
 
+# A coin type with the leading zeros of its package id dropped, so '0x0..2::sui::SUI' and '0x2::sui::SUI' match.
 def lend_ntype(t):
     return re.sub(r'^0x0*', '', str(t).split('::')[0].lower()) + '::' + '::'.join(str(t).split('::')[1:])
 
 
+# Called by verify_later right after check_tx; reads positions through lend_positions_rows (builder.ts 'positions-all').
 def lend_amount_check(intent, res, digest):
     """After check 2: did each lend's market really receive (about) what was planned? Positions after vs the reading taken
     before signing; short by more than 2% = a problem (S-06). Skipped, with a note, when the reading isn't usable."""
@@ -3678,6 +3791,8 @@ def lend_amount_check(intent, res, digest):
             res.setdefault('notes', []).append('lent %s on %s ✓' % (dec(got, 6), mk))
 
 
+# Check 2. Called by verify_later and scan_once (tests/test_check2.py too). Facts come from builder.ts 'tx-facts' (the chain):
+# balance changes, called modules, moved objects; compared with the plan's guard, sinks, pays and the 1% 'others' rule.
 def check_tx(digest, intent):
     """Compare the transaction on chain with the plan. Returns {'ok', 'problems', 'notes'}."""
     f = lend_cli('tx-facts', digest, timeout=60)
@@ -3828,15 +3943,18 @@ def pipe_plan(it):
     return {'steps': steps or [it.get('kind') or '?'], 'fee_sui': it.get('fee_sui') or 0, **({'router': it['router']} if it.get('router') else {})}
 
 
+# Background thread started in main.
 def unlogged_scan():
     """Every 10 min: a plan the user signed (or whose wallet reply got lost) but that the page never reported — tab closed,
     phone locked — is looked up on chain by its sender and checked like any other, so no signed transaction misses check 2.
-    Nothing found: noted on the plan's row. Candidates that don't match the plan: an alert line for review_checks (2026-10-23)."""
+    Nothing found: noted on the plan's row. Candidates that don't match the plan: an alert line for report_checks (2026-10-23)."""
     while True:
         time.sleep(600)
         scan_once()
 
 
+# One pass of the scan: Sui GraphQL lists the sender's last 10 transactions; the first that passes check_tx is the plan's.
+# Also run by tests/test_scan.py.
 def scan_once(min_age=600):
     q = 'query($a: SuiAddress!) { transactions(last: 10, filter: {sentAddress: $a}) { nodes { digest effects { timestamp } } } }'
     if True:
@@ -3876,12 +3994,14 @@ def scan_once(min_age=600):
 _VERIFY_WAIT = []                                     # checks that found the queue full: run as soon as a slot frees (audit nv #9)
 
 
+# Called by POST /api/tx/log and scan_once. Writes data/checks.jsonl, metrics.ptb + metrics.pipe, and the ✅/⚠️ mark on
+# the Kivy diary line; at most 4 checks run at once, the rest wait in _VERIFY_WAIT.
 def verify_later(digest, iid):
     """After a signed transaction: wait for it on chain, check it, record the verdict (never blocks the user)."""
     key = (digest, iid or '')                         # per plan: a check without a plan can't block the one with it (review 2026-10-24)
     if key in _VERIFYING:
         return
-    if len(_VERIFYING) >= 32:                         # never silent: kivy_watch alerts on this line (review 2026-10-24)
+    if len(_VERIFYING) >= 32:                         # never silent: watchdog alerts on this line (review 2026-10-24)
         print('kivy check dropped: %s… (%d checks waiting)' % (digest[:10], len(_VERIFYING)), flush=True)
         if len(_VERIFY_WAIT) < 500 and (digest, iid) not in _VERIFY_WAIT:
             _VERIFY_WAIT.append((digest, iid))       # delayed, never lost
@@ -3971,6 +4091,8 @@ def verify_later(digest, iid):
     threading.Thread(target=run, daemon=True).start()
 
 
+# Called by POST /api/tx/log and scan_once; writes diary.md in the Kivy folder (KIVY_DIARY), which tx_labels and
+# wallet_memory read back. Chain facts come from tx_detail (Sui GraphQL).
 def kivy_diary_add(digest, label=''):
     """Kivy's own diary: one line per on-chain transaction made through Kivy, newest on top under its UTC date.
     Every fact comes from the chain (status, sender, coins, fee, time) — the page only supplies the digest and a label."""
@@ -4018,10 +4140,13 @@ def kivy_diary_add(digest, label=''):
     return 'logged'
 
 
+# ── Section 12: config helpers — coin display names, the $ cap, K() (knowledge/kivy.json, hot-reloaded) and the
+#    login cookie used only when KIVY_PUBLIC=0; called from nearly every reader, card and route ──
 SPOT_NAME = {'BTC': 'xBTC'}                   # what the spot coin is really called on Sui
 SPOT_IN = {'XBTC': 'BTC'}                     # typed / AI names -> Kivy's internal key
 
 
+# Kivy key -> the name users see ('BTC' -> 'xBTC' on spot).
 def disp(sym):
     return SPOT_NAME.get(sym, sym)
 
@@ -4059,6 +4184,7 @@ def K():
     return dict(_KC['v'])
 
 
+# Login cookie (only when KIVY_PUBLIC=0): HMAC of the expiry with the session secret; made at POST /login, read by _authed.
 def sign(msg):
     return hmac.new(SECRET, msg.encode(), hashlib.sha256).hexdigest()
 
@@ -4076,6 +4202,9 @@ def valid(tok):
         return False
 
 
+# ── Section 13: prices, coins, balances, the guard, chain reads — Bluefin tickers + Tatum (fallback prices), Aftermath
+#    price-info (coin types), Sui GraphQL (knowledge 'graphql' URL) with gRPC via builder.ts as backup; used by cards,
+#    plans, the AI tools and GET /api/balances ──
 _PX = {'t': 0.0, 'p': {}}
 
 
@@ -4116,6 +4245,7 @@ TATUM_KEY = HERE / 'data' / 'tatum.key'
 _TATUM = {'skip': {}, 'ip': None, 'ip_t': 0.0}
 
 
+# The Tatum key file sits in the data folder (never logged); used only by tatum_rates.
 def tatum_get(path, timeout=8):
     """GET api.tatum.io over IPv4 (the key's allowlist has only the server's IPv4 address; IPv6 gets 403)."""
     import http.client, socket, ssl
@@ -4132,6 +4262,7 @@ def tatum_get(path, timeout=8):
     return r.status, json.loads(r.read() or b'{}')
 
 
+# Called by prices() for coins Bluefin has no ticker for.
 def tatum_rates(syms):
     """{SYM: usd} from Tatum's price API for the coins its plan covers (free: SUI, USDC, BTC, ETH, SOL; DEEP/WAL need a paid plan,
     so a 402 benches that coin for a day). Backup only: display prices, never the guard."""
@@ -4167,10 +4298,12 @@ def dec(x, sig=6, commas=True):
     return t.rstrip('0').rstrip('.') if '.' in t else t
 
 
+# 'mainnet' or 'testnet', from knowledge/kivy.json.
 def NET():
     return K().get('network') or 'mainnet'
 
 
+# Kivy's own coin list for the current network: {SYM: {'type', 'decimals', 'icon'?}} (knowledge/kivy.json).
 def COINS():
     k = K()
     return k['coins_testnet'] if NET() == 'testnet' else k['coins']
@@ -4183,6 +4316,7 @@ _ECO = {'t': 0, 'v': None}
 ECO_ALIAS = {'XBTC': 'BTC', 'SUIETH': 'ETH', 'USDSUI': 'USDsui'}
 
 
+# Extended list: also every coin the lending markets list, via builder.ts 'known-coins' (loaded once at start-up by main).
 def ecoins():
     """{SYM: {'type', 'decimals', 'icon'}} — Kivy's coins first, then every listed coin. Cached an hour."""
     if _ECO['v'] and time.time() - _ECO['t'] < 3600:
@@ -4224,6 +4358,7 @@ def ckey(word):
     return next((k for k in e if k == w), None) or next((k for k in e if k.lower() == w.lower()), None)
 
 
+# Coin info for a Kivy key, from Kivy's list or the extended one; KeyError for an unknown coin.
 def cinfo(sym):
     return COINS().get(sym) or ecoins()[sym]
 
@@ -4250,6 +4385,8 @@ def all_balances(address):
 GUARD_GAS_MIST = 100_000_000        # most net SUI a Kivy transaction may spend on gas/storage (0.1 SUI; real: ~0.0002-0.012)
 
 
+# Every POST /api/tx/* answer carries one; the page's check 1 enforces it before signing, and check_tx reads the same
+# guard (saved in the plan) after signing.
 def guard(out=None, recv=None, ctokens=False, pay=None, gas=GUARD_GAS_MIST):
     """What the approved action may do to the user's wallet. The browser simulates the final transaction
     and refuses to sign if it spends more than `out`, receives less than `recv`, spends other coins,
@@ -4298,6 +4435,7 @@ def rpc(method, params, timeout=15):
     return d.get('result')
 
 
+# One Sui GraphQL query (URL from knowledge/kivy.json 'graphql' for the network); raises on GraphQL errors.
 def gql(query, variables=None):
     url = K()['graphql'][NET()]
     req = urllib.request.Request(url, data=json.dumps({'query': query, 'variables': variables or {}}).encode(),
@@ -4409,6 +4547,7 @@ def defi_positions(address):
     return out
 
 
+# The wallet's coins as plain text with $ values — the rule-based reply()'s balance answer.
 def balances_text(address):
     k = K()
     b = balances(address)
@@ -4437,6 +4576,8 @@ def balances_text(address):
     return '\n\n'.join(parts)
 
 
+# ── Section 14: rule-based reply() fallback (used when the AI is off/busy), FAQ, recipient checks + SuiNS, gasless sends ──
+# An amount word or number from reply()'s patterns -> a float ('all' / 'half' read against the wallet).
 def _amt(v, coin, address):
     try:
         return float(v)
@@ -4609,11 +4750,14 @@ GASLESS = {'USDC'}          # Sui gasless stablecoin transfers (protocol 125, Ma
 GASLESS_MIN = 0.01
 
 
+# True when a send can go as a Sui gasless stablecoin transfer (the page then builds it without SUI for gas).
 def gasless_send(coin, amt):
     return NET() == 'mainnet' and coin in GASLESS and amt >= GASLESS_MIN
 
 
-LEND_DIR = KIVY_HOME / 'lend'
+# ── Section 15: lending — the USDC markets (PROTOS), market names, builder.ts reads (rates, collateral, positions), the
+#    lend card and spend checks; used by widget_reply, chains, the AI tools and /api/lend*, /api/tx/lend ──
+LEND_DIR = KIVY_HOME / 'builder'
 PROTOS = {'suilend': 'Suilend Main Market', 'suilend-ember': 'Suilend Ember', 'suilend-matrixdock': 'Suilend Matrixdock',
           'navi': 'NAVI', 'navi-highyield': 'NAVI High Yield', 'navi-prime': 'NAVI Prime'}
 VAULTS = {'navi-highyield', 'navi-prime'}
@@ -4623,6 +4767,7 @@ MARKET_ALIASES = [('suilend-matrixdock', r'matri\w*(?:\s*do[ckx]\w*)?'), ('suile
                   ('navi', r'navi'), ('suilend', r'suilend\s+main'), ('suilend', r'suilend'), ('suilend', r'main')]
 
 
+# The first market a text names (most specific alias first), or None.
 def market_in(text):
     for key, pat in MARKET_ALIASES:
         if re.search(r'\b' + pat + r'\b', text, re.I):
@@ -4649,6 +4794,7 @@ _CLI_TTL = {'perp-positions': 15, 'rewards': 30}      # per-wallet reads one cha
 _CLI_CACHE = {}
 
 
+# Every GET to builder.ts goes through here: GET /<cmd>?a=..&a=.. (rates, positions-all, build, perp-*, tx-facts …).
 def lend_cli(*args, timeout=150):
     """Ask Kivy's lending builder (kivy-lend.service, localhost only). It never holds a key. A wallet's perps positions and
     rewards are reused for 15 / 30 s — never after that wallet signs a transaction (mark_dirty)."""
@@ -4670,6 +4816,7 @@ def lend_cli(*args, timeout=150):
     return out
 
 
+# USDC lending rates per market (builder.ts 'rates'), cached 5 min: the USDC table and apr_of / best_proto.
 def lend_rates():
     t, v = _LEND['rates']
     if v and time.time() - t < 300:
@@ -5000,6 +5147,8 @@ def to_opts(coin):
     return [coin] + [a for a in K()['assets'] if a != coin]
 
 
+# ── Section 16: move — withdraw a lent coin, swap it, lend it elsewhere, ONE approval; move_parse/move_card are called
+#    by widget_reply, the card posts to /api/tx/withdrawswap (lend_to set) -> builder.ts 'withdrawswap' ──
 # ── Move: withdraw a lent coin, swap it if needed, and lend it on another market — ONE transaction (2026-10-20) ──
 MOVE_RE = re.compile(r'^\s*(?:withdraw|take|pull|move|shift)\s+(?:(all|half|max|[\d.]+)\s+(?:of\s+)?)?(?:(?:my|the)\s+)?([A-Za-z]{2,10})\s+'
                      r'(?:out\s+)?from\s+(.+?)\s*(?:,|\band\b|\bthen\b|&|\bto\b)\s*(.*)$', re.I)
@@ -5029,6 +5178,7 @@ def move_parse(msg):
     return {'coin': coin, 'amount': m.group(1), 'src': m.group(3), 'to': to, 'where': where}
 
 
+# The move card for move_parse's reading: picks the lent row (market / protocol family), or asks which one.
 def move_card(mv, address):
     coin, to = mv['coin'], mv['to']
     if not to:
@@ -5076,6 +5226,8 @@ def move_card(mv, address):
     return card
 
 
+# ── Section 17: chains — a sentence with several steps (withdraw / swap / lend / send / perps / keep) read into one spec;
+#    chain_parse is called by widget_reply and typo_chain, the card posts the spec to /api/tx/compose -> builder.ts POST /compose ──
 # ── Chains: several steps in ONE transaction (2026-10-20: "can kivy handle several complex txn steps") ──
 # A message like "use 5 SUI from my wallet, swap to USDC, lend half on NAVI and send the rest to bob.sui" becomes a
 # spec for the builder's compose engine: one source (wallet coin or a withdrawal), up to 2 swaps, then 1-4 final steps
@@ -5562,6 +5714,7 @@ def chain_coverage(msg, r):
                     "at most 2 swaps, and each split part can be lent or kept. Split it into two requests, or say it differently." % ', '.join(missing[:5])}
 
 
+# 'the best staked SUI': swaps in the best-paying staked SUI (staked_ranked) and reads the sentence again.
 def _chain_parse_staked(msg, address):
     if STAKED_ASK.search(msg) and not STAKED_NAMED.search(msg) and not re.search(r'\bunstak', msg, re.I):
         lend_at = re.search(r'\b(?:lend|deposit|put|park|supply)\w*\b(.*)$', msg, re.I)   # "…and lend it on suilend": best staked SUI THERE
@@ -5577,6 +5730,8 @@ def _chain_parse_staked(msg, address):
     return _chain_parse(msg, address)
 
 
+# The chain reader itself: normalise the sentence, try fan-outs, split into clauses, read source -> swaps -> sinks,
+# then chain_coverage makes sure nothing the user named was dropped. Returns a chain_card, a question, or None.
 def _chain_parse(msg, address):
     msg = re.sub(r'(?<=[A-Za-z0-9%)])\.\s+(?=[A-Za-z])', ', ', msg)   # "Withdraw … . Swap to SUI. Lend …": sentences are steps (review 2026-10-25)
     msg = re.sub(r'\s\+\s*(?=\$?\d)', ' plus ', msg)                # "+ 0.4 usdc from my wallet" = a top-up
@@ -6140,6 +6295,8 @@ def chain_card(spec, src, swaps, sinks, hand):
                               if src.get('pick') and src.get('max') and all(k['amount'][0] != 'units' for k in sinks) else {}))}
 
 
+# ── Section 18: builder POSTs + withdraw cards + plan() — builder.ts POST endpoints (/compose, /dust, /sendmany, /swapcheck,
+#    /swapalt, /kind-calls), the withdraw slider card, and plan(): the confirm card for swap / send / USDC lend / withdraw ──
 def lend_post(path, body, timeout=300):
     """POST to Kivy's builder (localhost only). A swap route that a DEX on it rejects in the test run (MoveAbort in a
     'router' module — the 0x7de5… adapter flakes now and then) gets ONE retry with a fresh route (2026-10-25)."""
@@ -6179,6 +6336,7 @@ def wd_preset(card, msg):
     return card
 
 
+# The withdraw slider for one lent row (optionally 'then swap to X'); the card posts to /api/tx/lend or /api/tx/withdrawswap.
 def withdraw_card(row, to=None):
     to = to if to in to_opts(row['coin']) else row['coin']
     return {'text': 'Slide to choose how much %s to withdraw from %s%s.' % (disp(row['coin']), row['name'],
@@ -6204,6 +6362,7 @@ def lend_positions(addr, fresh=False):
     return v
 
 
+# The USDC market paying the most right now (NAVI if rates can't be read).
 def best_proto():
     try:
         r = lend_rates()
@@ -6212,6 +6371,7 @@ def best_proto():
         return 'navi'
 
 
+# A USDC market's total yearly rate, %, or None when unreadable.
 def apr_of(p):
     try:
         return float((lend_rates().get(p) or {}).get('total_apr') or 0)
@@ -6235,6 +6395,9 @@ def word_amount(word, coin, holdings):
     return have * share
 
 
+# The confirm card ('plan') for one swap / send / USDC lend / withdraw: allowed coins, $ cap, balance, gas, recipient, then
+# title, steps, risks and rows. Called by reply(), the AI's plan_* tools, send readers and again by POST /api/tx/swap,
+# /api/tx/lend and /api/tx/check-send (the same rules re-checked at build time). Never builds or signs anything.
 def plan(kind, amt, a, b=None, holdings=None, recipient=None, protocol=None, lent=None, all_=False, sender=None):
     k = K()
     ASSETS, CAP_USD, VENUES = k['assets'], cap_usd(), k['venues']
@@ -6468,9 +6631,12 @@ def plan_send_many(items, recipient, holdings, sender):
                      'cost': 'Est. %s SUI' % dec(float(k['gas_sui'])), 'status': k['plan_status']}}
 
 
+# ── Section 19: transactions read back, fees, the swap router, spot charts, order books — Sui GraphQL (tx_detail),
+#    Aftermath router (+ Cetus / Bluefin 7k backups via builder.ts), DeepBook indexer, GeckoTerminal ──
 DIGEST_RE = re.compile(r'^[1-9A-HJ-NP-Za-km-z]{32,44}$')
 
 
+# SuiVision link for a digest on the current network.
 def explorer_tx(digest):
     return ('https://suivision.xyz/txblock/' if NET() == 'mainnet' else 'https://%s.suivision.xyz/txblock/' % NET()) + digest
 
@@ -6486,6 +6652,8 @@ ROUTER_FEE_WALLETS_SRV = {'0x1fb0c0a6790860fc83c8f26f6fa089868ad94de9468348f98df
 OUTFLOW_FN = re.compile(r'withdraw|redeem|borrow|claim|collateral|unstake|liquidat', re.I)
 
 
+# check_tx: True when the calls are a plain aggregator swap (an allowlisted aggregator package, nothing pulling coins out),
+# so a coin only the route touched is noted, not flagged.
 def pure_agg_swap(calls):
     n = lambda a: re.sub(r'^0x0*', '', str(a or '').lower())
     cs = [str(c).split('::') for c in calls or [] if str(c).count('::') >= 2]
@@ -6499,7 +6667,7 @@ AGG_PKGS_SRV = {'0x7de5de8d75a8f4e42cdd3c018f788bc9b9ebf2d3d61dcfe9d2136f17f077a
 
 def slip_for(a, b):
     """Swap slippage (a fraction) for the pair a -> b: the tightest tier that holds BOTH coins (stablecoins 0.05%, SUI and its
-    staked versions 0.1%, big coins 0.2%), else Kivy's ceiling (0.5%). 2026-10-24: "as low as possible". Same rule in lend.ts."""
+    staked versions 0.1%, big coins 0.2%), else Kivy's ceiling (0.5%). 2026-10-24: "as low as possible". Same rule in builder.ts."""
     k = K()
     cap = float(k['slippage_cap_pct'])
     t = k.get('slippage_tiers') or {}
@@ -6602,11 +6770,13 @@ def fee_reserve():
     return 0.0
 
 
+# Kivy's Aftermath referral code from knowledge/kivy.json, or '' (used by GET /api/fee and POST /api/perp/referral).
 def ref_code():
     c = str((K().get('revenue') or {}).get('aftermath_ref_code') or '').strip()
     return c if re.match(r'^[A-Za-z0-9_-]{2,40}$', c) else ''
 
 
+# Kivy's swap fee as a %, for the cards' cost line (0 while off).
 def rev_fee_pct():
     f = rev_fee()
     return round(f['feePercentage'] * 100, 4) if f else 0
@@ -6633,6 +6803,8 @@ def route_body(body):
     return body
 
 
+# Called by POST /api/tx/swap: Aftermath trade-route + v1/transactions/trade (a tx kind the browser completes), then builder.ts
+# /swapcheck runs it; a failing route is rebuilt by /swapalt (Cetus, then Bluefin 7k).
 def swap_tx(addr, a, b, amt, min_out=0):
     """Aftermath router: route + a complete transaction for this wallet to sign (1% slippage)."""
     k = K(); ca, cb = cinfo(a), cinfo(b)
@@ -6729,6 +6901,7 @@ def deepbook_chart(sym, pool):
     return {'symbol': sym, 'candles': hit[1], 'mark': last or (hit[1][-1][4] if hit[1] else None), 'source': 'DeepBook ' + pool.replace('_', '/')}
 
 
+# GET /api/spot/chart: DeepBook candles when the pool trades enough, else GeckoTerminal (gecko_chart).
 def spot_chart(sym):
     try:                                              # DeepBook first (on-chain order book); DEX-pool data otherwise
         pool = deepbook_pool(sym)
@@ -6767,6 +6940,7 @@ def gecko_chart(sym):
     return {'symbol': sym, 'candles': hit[1], 'mark': live or (hit[1][-1][4] if hit[1] else None), 'source': 'Sui DEX pools'}
 
 
+# GeckoTerminal: the coin's deepest Sui pool (cached a day) and its 15-min candles (cached a minute).
 def _spot_candles(sym, t, get, quote):
     pool = _SPOT.get(('pool', sym))
     if not pool or time.time() - pool[0] > 86400:
@@ -6828,6 +7002,8 @@ def market_book(venue, sym):
     return r
 
 
+# ── Section 20: markets by name, sends, cross-account requests — market_switch, send_reply and xw_parse are all called
+#    by widget_reply before the perps and chain readers ──
 # ── Changing market by name (2026-10-21: "open korean market" got a vague answer) ──
 # Full names for every market we are sure of; a ticker always works too. Groups ask with choices.
 MARKET_NAMES = {
@@ -6929,6 +7105,7 @@ def market_find(text, strict=False):
     return None
 
 
+# A 'which one?' choice card for a group of markets (market_find's 'group' result) with live price and 24h move.
 def market_choices(label, syms, address=None):
     rows = {r['symbol']: r for r in perp_market_list()}
     opts = []
@@ -7208,6 +7385,7 @@ XW_ATOMIC_RE = re.compile(r'\b(?:in\s+(?:one|a\s+single|the\s+same|1)\s+(?:trans
 XW_OTHER_RE = re.compile(r'\bmy\s+other\s+(?:wallet|account)\b', re.I)
 
 
+# The user's connected accounts for this request (XW.accounts from /api/chat's body), the active one first.
 def xw_accounts(address):
     acc = [x for x in (getattr(XW, 'accounts', None) or []) if isinstance(x, dict) and ADDR_RE.match(str(x.get('a') or ''))][:10]
     if address and not any(x['a'].lower() == address.lower() for x in acc):
@@ -7215,6 +7393,7 @@ def xw_accounts(address):
     return acc
 
 
+# Coins an earlier leg of a cross-account plan (xw_parse) sends to this account: {coin: amount}; spend checks count them.
 def xw_extra(address):
     return (getattr(XW, 'extra', None) or {}).get((address or '').lower()) or {}
 
@@ -7265,6 +7444,8 @@ def xw_handoff(widget):
     return None, None
 
 
+# 'send 1 usdc from my phantom account to my slush one': a plan per leg across the user's own accounts (xwallet card);
+# each leg is approved in its own wallet. None when fewer than 2 accounts are connected.
 def xw_parse(msg, address, history=None):
     msg = re.sub(r'\s*:\s*(?=0x[0-9a-fA-F]{4,})', ' ', msg)   # "to this address: 0x…" — the colon is not a step break
     accts = xw_accounts(address)
@@ -7397,6 +7578,8 @@ def xw_parse(msg, address, history=None):
             'widget': {'type': 'xwallet', 'legs': plans}}
 
 
+# ── Section 21: market overview, warm-up thread, login page, request limits, admin list, CSP ──
+# Used by GET /api/market/view and widget_reply (the trading page card).
 def market_overview(word, address=None):
     """Everything about one coin on both venues, for the market card: which sides exist, names, icon, what the user holds."""
     w = re.sub(r'[^A-Za-z0-9&]', '', str(word or '')).upper()
@@ -7427,6 +7610,7 @@ def market_overview(word, address=None):
 _ACTIVE = {'t': time.time()}                         # last real visitor API request (the watchdog's page loads don't count)
 
 
+# Background thread (started at import): refreshes perp_market_list every 15 s while someone used the API in the last 10 min.
 def _warm_markets():
     import threading
     def loop():
@@ -7518,6 +7702,7 @@ def csp_for(page):
     return out
 
 
+# The CSP header with a sha256 for each inline <script> of this page (index.html is built by tools/build_page.py).
 def _csp_build(page):
     try:
         txt = page.decode() if isinstance(page, bytes) else str(page)
@@ -7528,6 +7713,9 @@ def _csp_build(page):
     return CSP.replace('{HASHES}', ''.join(h + ' ' for h in hs))
 
 
+# ── Section 22: Handler — one instance per HTTP request (ThreadingHTTPServer: one thread each).
+#    do_GET / do_POST -> https-only redirect -> _heavy (per-IP limits + slot pools) -> _do_GET / _do_POST (the routes)
+#    -> _send (every answer: fee + guard + plan + allowlist on tx builds, plain errors, security headers). ──
 class Handler(BaseHTTPRequestHandler):
     def _real_ip(self):
         """Cloudflare's visitor address; without the header, the peer itself unless it is this box (tests, the tunnel) — so
@@ -7543,6 +7731,8 @@ class Handler(BaseHTTPRequestHandler):
         peer = self.client_address[0] if self.client_address else ''
         return None if peer in ('127.0.0.1', '::1', '::ffff:127.0.0.1') else peer
 
+    # Runs a route under the abuse limits: LIGHT routes get the per-IP rate only; HEAVY ones also take a slot (6 per IP,
+    # and separate pools for chat, transaction builds and reads) so one slow upstream can't block the rest.
     def _heavy(self, fn):
         path = self.path.split('?', 1)[0]
         if path in LIGHT:                              # quick reads: the per-visitor limit only (red-team 2026-10-24)
@@ -7577,7 +7767,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             pool = _CHAT_ALL if path == '/api/chat' else _BUILD_ALL if path in TX_BUILD else _HEAVY_ALL   # chats, builds and reads: separate slots
             if not pool.acquire(timeout=8):
-                print('kivy busy: %s refused, all slots taken' % path, flush=True)   # kivy_watch alerts on these
+                print('kivy busy: %s refused, all slots taken' % path, flush=True)   # watchdog alerts on these
                 return self._send(503, '{"error":"Kivy is busy right now — try again in a moment."}', 'application/json')
             try:
                 return fn()
@@ -7612,6 +7802,7 @@ class Handler(BaseHTTPRequestHandler):
         self._seen()
         return self._heavy(self._do_POST)
 
+    # Marks real visitor API traffic (keeps the markets warm-up loop running).
     def _seen(self):
         if self.path.startswith('/api/') and self._real_ip():
             _ACTIVE['t'] = time.time()
@@ -7623,6 +7814,7 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass
 
+    # Always true while KIVY_PUBLIC=1; otherwise the dashboard login cookie (valid()).
     def _authed(self):
         if PUBLIC:
             return True  # 2026-10-15: 'no need to lock kivy'
@@ -7632,6 +7824,10 @@ class Handler(BaseHTTPRequestHandler):
                 return True
         return False
 
+    # Every response goes through here. For a successful POST /api/tx/* build it also: adds Kivy's flat fee to the guard
+    # (multi-step only), saves the plan (remember_intent -> intent_id), lists the tx's calls via builder.ts /kind-calls when
+    # needed, and refuses any program outside kivy_pkgs.json (pkg_watch). Failed builds count in metrics.failure;
+    # raw builder/SDK errors are replaced by plain text. Then the security headers (CSP from csp_for, HSTS, no-store …).
     def _send(self, code, body, ctype='text/html; charset=utf-8', extra=()):
         if code == 200 and getattr(self, 'command', '') == 'POST' and self.path.split('?', 1)[0] in TX_BUILD:
             try:
@@ -7715,6 +7911,13 @@ class Handler(BaseHTTPRequestHandler):
     def _redirect(self, where, extra=()):
         self._send(303, '', extra=(('Location', where),) + tuple(extra))
 
+    # GET routes (the page's reads; nothing here builds or signs):
+    #   /login /logout · /api/fee · /internal/* (kivystats, local + token: customers, metrics, public, public-switch, export)
+    #   /vendor/*.js /app/*.js|woff2 /icons/* favicons (hash-checked static files) · /api/terms /terms /privacy (accounts.py)
+    #   /api/me /api/chats (accounts.py) · perps: /api/perp/preview, positions, cancel-preview, history (builder.ts perp-*)
+    #   markets: /api/market/list, view, book · /api/chart /api/spot/chart · /api/swap/quote (Aftermath router)
+    #   wallet: /api/lend/rewards /api/lend /api/lend/others /api/balances /api/send/assets /api/recipient
+    #   activity: /api/tx/labels /api/tx/detail /api/memory · / (index.html, templated from knowledge/kivy.json, ETag-cached)
     def _do_GET(self):
         path = self.path.split('?', 1)[0]
         if PUBLIC and path == '/login':
@@ -7824,14 +8027,17 @@ class Handler(BaseHTTPRequestHandler):
             if not f.is_file():
                 return self._send(404, 'not found', 'text/plain')
             return self._send(200, f.read_bytes())
+        # who is signed in (accounts.py's sign-in cookie)
         if path == '/api/me':
             return self._send(200, json.dumps({'email': accounts.email_from_cookie(self.headers.get('Cookie'))}),
                               'application/json')
+        # the signed-in wallet's saved chats (accounts.py)
         if path == '/api/chats':
             email = accounts.email_from_cookie(self.headers.get('Cookie'))
             if not email:
                 return self._send(401, '{"error":"sign in with your wallet to keep chats"}', 'application/json')
             return self._send(200, json.dumps(accounts.list_chats(email)), 'application/json')
+        # the trade panel's live preview of an order — builder.ts 'perp-preview' (nothing to sign)
         if path == '/api/perp/preview':
             from urllib.parse import parse_qs, urlparse
             q = parse_qs(urlparse(self.path).query)
@@ -7850,6 +8056,7 @@ class Handler(BaseHTTPRequestHandler):
             if r.get('ok') and r.get('has_position') and ADDR_RE.match(addr):
                 r['pos_lev'] = open_lev(addr, sym)         # the order panel locks its leverage to the open position's (Aftermath Error 1022)
             return self._send(200, json.dumps(r), 'application/json')
+        # the wallet tab's perps positions and orders — builder.ts 'perp-positions'
         if path == '/api/perp/positions':
             from urllib.parse import parse_qs, urlparse
             addr = (parse_qs(urlparse(self.path).query).get('address') or [''])[0]
@@ -7866,6 +8073,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, json.dumps(r), 'application/json')
             except Exception:
                 return self._send(502, '{"error":"positions unavailable"}', 'application/json')
+        # spot price chart for a Kivy coin (DeepBook or GeckoTerminal)
         if path == '/api/spot/chart':
             from urllib.parse import parse_qs, urlparse
             sym = ((parse_qs(urlparse(self.path).query).get('coin') or [''])[0]).upper()
@@ -7916,6 +8124,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, json.dumps(mv), 'application/json')
             except Exception:
                 return self._send(502, '{"error":"market unavailable"}', 'application/json')
+        # order book + recent trades for the trading page (perps: Aftermath, spot: DeepBook)
         if path == '/api/market/book':
             from urllib.parse import parse_qs, urlparse
             q = parse_qs(urlparse(self.path).query)
@@ -7927,6 +8136,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, json.dumps(market_book(venue, sym)), 'application/json')
             except Exception:
                 return self._send(502, '{"error":"book unavailable"}', 'application/json')
+        # the swap box's live quote (no transaction)
         if path == '/api/swap/quote':
             from urllib.parse import parse_qs, urlparse
             q = parse_qs(urlparse(self.path).query)
@@ -7940,6 +8150,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(400, '{"error":"bad request"}', 'application/json')
             except Exception:
                 return self._send(502, '{"error":"no route right now"}', 'application/json')
+        # the wallet's perps trade history — builder.ts 'perp-history'
         if path == '/api/perp/history':
             from urllib.parse import parse_qs, urlparse
             addr = (parse_qs(urlparse(self.path).query).get('address') or [''])[0]
@@ -7949,6 +8160,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, json.dumps(lend_cli('perp-history', addr)), 'application/json')
             except Exception:
                 return self._send(502, '{"error":"history unavailable"}', 'application/json')
+        # perps chart: candles + mark / oracle / book prices + funding stats, read in parallel
         if path == '/api/chart':
             from urllib.parse import parse_qs, urlparse
             q = parse_qs(urlparse(self.path).query)
@@ -7985,6 +8197,7 @@ class Handler(BaseHTTPRequestHandler):
                                                    'oracle': oracle, 'book': book, 'stats': stats}), 'application/json')
             except Exception:
                 return self._send(502, '{"error":"chart data unavailable"}', 'application/json')
+        # rewards waiting in every lending market — builder.ts 'rewards'
         if path == '/api/lend/rewards':
             from urllib.parse import parse_qs, urlparse
             addr = (parse_qs(urlparse(self.path).query).get('address') or [''])[0]
@@ -8053,6 +8266,7 @@ class Handler(BaseHTTPRequestHandler):
             icons = {r.get('token'): r.get('icon') for r in lend_rates_all() if r.get('token') and r.get('icon')}
             rows = [dict(x, icon=icons.get(x['coin']) or icons.get(x['coin'].upper())) for x in other_lent(addr, fresh=True)]
             return self._send(200, json.dumps({'rows': rows}), 'application/json')
+        # the wallet panel: USDC rates, USDC positions and the perps account in one read
         if path == '/api/lend':
             from urllib.parse import parse_qs, urlparse
             addr = (parse_qs(urlparse(self.path).query).get('address') or [''])[0]
@@ -8067,6 +8281,7 @@ class Handler(BaseHTTPRequestHandler):
                                                    'positions': lend_positions(addr) if ADDR_RE.match(addr) else {}}), 'application/json')
             except Exception:
                 return self._send(502, '{"error":"lending read failed"}', 'application/json')
+        # one transaction from the chain (Activity detail) — tx_detail, Sui GraphQL
         if path == '/api/tx/detail':
             from urllib.parse import parse_qs, urlparse
             d = (parse_qs(urlparse(self.path).query).get('digest') or [''])[0]
@@ -8074,6 +8289,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, json.dumps(tx_detail(d)), 'application/json')
             except Exception:
                 return self._send(502, '{"error":"chain read failed"}', 'application/json')
+        # the wallet panel's coins, prices, 24h moves and the coin-type table the Activity tab names coins with
         if path == '/api/balances':
             from urllib.parse import parse_qs, urlparse
             addr = (parse_qs(urlparse(self.path).query).get('address') or [''])[0]
@@ -8123,12 +8339,24 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, page, extra=(('ETag', _PAGE['etag']), ('Cache-Control', 'private, no-cache')))
         return self._send(404, 'not found', 'text/plain')
 
+    # The request body as text; refused above `limit` bytes (24 kB, or 160 kB for a saved chat).
     def _body(self, limit=4096):
         n = int(self.headers.get('Content-Length') or 0)
         if n < 0 or n > limit:  # history included
             raise ValueError('too large')
         return self.rfile.read(n).decode('utf-8', 'replace')
 
+    # POST routes. Every cookie-bearing or money route checks Origin == the Kivy site.
+    #   /api/auth/challenge, /api/auth/wallet, /api/auth/logout, /api/chats/save|delete — wallet sign-in + chats (accounts.py)
+    #   /login — dashboard login (only when KIVY_PUBLIC=0)
+    #   transaction builds (TX_BUILD; Terms must be signed when on): /api/tx/swap (Aftermath router), /api/tx/lend,
+    #     /api/tx/swaplend, /api/tx/withdrawswap, /api/tx/perp (builder.ts GET commands), /api/tx/dust, /api/tx/compose,
+    #     /api/tx/sendmany (builder.ts POST), /api/tx/check-send (plain send; the page builds it) — each re-checks the card's
+    #     numbers and returns {tx | tx_kind, guard}; _send then adds the fee, saves the plan and checks the allowlist
+    #   /api/perp/referral (Aftermath referrals API) and /api/perp/pro-orders (builder.ts), both with the wallet's signed message
+    #   /api/m, /api/feedback (anonymous numbers + thumbs, metrics.py)
+    #   /api/pipeline (check-1 / signing results) · /api/wallet/probe (wallet diagnostics log) · /api/tx/log (signed digest ->
+    #     Kivy diary + check 2) · /api/chat (the chat pipeline, see the file header)
     def _do_POST(self):
         path = self.path.split('?', 1)[0]
         try:
@@ -8143,6 +8371,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._req = {}
             if accounts.terms_on() and not accounts.agreed((self._req or {}).get('address')):   # no transaction before the Terms are signed
                 return self._send(403, json.dumps({'error': "Agree to Kivy's Terms first: tap Agree & sign.", 'terms': True}), 'application/json')
+        # wallet sign-in (signed challenge message) and saved chats — all in accounts.py
         if path.startswith('/api/auth/') or path.startswith('/api/chats/'):
             origin = self.headers.get('Origin')
             if origin != ORIGIN:                       # cookie-bearing writes: same site only
@@ -8187,6 +8416,7 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError as exc:
                 return self._send(400, json.dumps({'error': str(exc)}), 'application/json')
             return self._send(200, '{"ok":true}', 'application/json')
+        # dashboard username/password form (KIVY_PUBLIC=0 only); a wrong guess waits 1 s
         if path == '/login':
             from urllib.parse import parse_qs
             f = parse_qs(raw)
@@ -8196,6 +8426,8 @@ class Handler(BaseHTTPRequestHandler):
                                              '; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=%d' % TTL),))
             time.sleep(1.0)                          # slow down guessing
             return self._send(401, LOGIN.replace('{ERR}', '<div class="err">Wrong username or password.</div>'))
+        # the swap card: plan() rules again, then swap_tx (Aftermath route; Cetus / Bluefin 7k backups); the guard pins the
+        # minimum the user saw (409 when the route got worse)
         if path == '/api/tx/swap':
             origin = self.headers.get('Origin')
             if origin and origin != ORIGIN:
@@ -8230,6 +8462,7 @@ class Handler(BaseHTTPRequestHandler):
                         base_units(seen_min, cb['decimals']) if seen_min else 0)   # never below what the user approved
             out['guard'] = guard(out={t_in: max_in}, recv={cb['type']: str(max(1, floor))})   # the wallet must receive at least the route's minimum (was 1 unit)
             return self._send(200, json.dumps(out), 'application/json')
+        # lend / withdraw / claim on one market — builder.ts 'build'; USDC deposits re-run plan(), other coins spend_check
         if path == '/api/tx/lend':
             origin = self.headers.get('Origin')
             if origin and origin != ORIGIN:
@@ -8653,6 +8886,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, '{}', 'application/json')
             except Exception:
                 return self._send(400, '{"error":"bad request"}', 'application/json')
+        # the page reports a signed transaction: Kivy diary line (kivy_diary_add) + check 2 (verify_later) for its plan
         if path == '/api/tx/log':
             # red-team 2026-10-24: anyone could post any digest + free text here, which landed in the victim's Activity,
             # greeting and AI notes, and the first post skipped check 2. Now: the Kivy page only, a per-visitor limit, the label
@@ -8702,6 +8936,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, json.dumps({'diary': d}), 'application/json')
             except Exception:
                 return self._send(400, '{"error":"bad request"}', 'application/json')
+        # every perps transaction: open account, deposit, withdraw, order (market / limit / stop / scale / TWAP), cancel,
+        # close, add margin, TP/SL — each built by a builder.ts 'perp-*' command
         if path == '/api/tx/perp':
             origin = self.headers.get('Origin')
             if origin and origin != ORIGIN:
@@ -8919,6 +9155,8 @@ class Handler(BaseHTTPRequestHandler):
             names = {c['to']: c['to_in'] for c in clean if c['to_in'].lower() != c['to']}
             return self._send(200, json.dumps({'ok': True, 'tx': out['tx'], 'plan': out['plan'], 'names': names,
                                                'guard': guard(out=wal, ctokens=any(c['source'] != 'wallet' for c in clean), pay=pays)}), 'application/json')
+        # a plain send (one coin, or up to 8 coins to one address): plan('send') checks it, returns the resolved address,
+        # base units and the guard; the page builds the transaction itself (gasless USDC when possible)
         if path == '/api/tx/check-send':
             origin = self.headers.get('Origin')
             if origin and origin != ORIGIN:
@@ -8965,6 +9203,8 @@ class Handler(BaseHTTPRequestHandler):
                                                'guard': guard(out={c['type']: units},
                                                               pay={'address': chk['plan']['to_full'], 'coin_type': c['type'], 'amount': units})}),
                               'application/json')
+        # the chat pipeline: secret guard -> tidy -> typo/intent readers -> widget_reply -> intent_ask -> (privacy-off code
+        # path) -> ai_reply -> reply(); every answer is {'text', 'widget'?, 'plan'?, 'ai'} and logs to metrics for real visitors
         if path == '/api/chat':
             if not self._authed():
                 return self._send(401, '{"error":"sign in"}', 'application/json')
@@ -9055,6 +9295,8 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(404, 'not found', 'text/plain')
 
 
+# ── Section 23: cache sweeper + main ──
+# Background thread started in main; also prunes old plans (IntentStore) and freezes the day's metrics snapshot.
 def sweep_caches():
     """Every 5 minutes: drop cache entries older than an hour, keep each cache under 5,000 entries (audit W01).
     Only (timestamp, value) entries are touched, so live caching works exactly as before."""
@@ -9084,6 +9326,7 @@ def sweep_caches():
             pass
 
 
+# Start-up: cache sweeper, unreported-transaction scan, coin-list warm-up, then serve on localhost:PORT until stopped.
 if __name__ == '__main__':
     threading.Thread(target=sweep_caches, daemon=True).start()
     threading.Thread(target=unlogged_scan, daemon=True, name='kivy-unlogged').start()

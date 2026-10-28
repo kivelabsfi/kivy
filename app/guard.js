@@ -27,6 +27,9 @@ var ROUTER_FEE_WALLETS = ['0x1fb0c0a6790860fc83c8f26f6fa089868ad94de9468348f98df
 // route is trusted wherever it goes — a coin only the route touches may go to any address (a pool's fee wallet); the user's own
 // coins keep the 1% limit and every "you must receive" check below
 var AGG_PKGS = ['0x7de5de8d75a8f4e42cdd3c018f788bc9b9ebf2d3d61dcfe9d2136f17f077afd5', '0xffd4058af7d6f6d66c335930cced8c91e38ec943e2392232aee27e8127e684e9', '0x62412b7268c35f3808336aee57a52836501f40b8ba5d936f8ad275e672befd04'].map(normAddr);
+// json: the transaction as the wallet will get it; g: the server's guard (out / in / vol / pay / gas / fee);
+// addr: the signer. Resolves with the balance changes (for pipe), rejects with the reason the card shows.
+// Called by sign() in kivyAct1.
 function checkIntent(json, g, addr) {
   if (!g) return Promise.reject(new Error('Kivy could not check this transaction, so it was not sent.'));
   var calls = [], reserve = {}, odd = false;

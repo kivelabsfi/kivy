@@ -25,7 +25,7 @@ knowledge/KIVYSOUL.md
 knowledge/TOOLS.md
 
 # not for the public repo (judge review 2026-10-28): developer probes, a one-off script, generated data
-lend/probe/
-lend/pa.ts
-lend/perps_markets.json   # generated hourly by tools/perps_markets_sync.py
+builder/probe/
+builder/pa.ts
+builder/perps_markets.json   # generated hourly by tools/sync_perps_markets.py
 app/words_en.txt   # a generic English word list (typo fixer); not needed to read the code

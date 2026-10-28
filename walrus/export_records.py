@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+# export_records.py — step 1 of the Walrus saver: turns Kivy's security records into plain text for Walrus Memory.
+# Run by sync_records.sh (cron); prints a JSON list of {key, digest, ns, text} on stdout, which upload.mjs reads.
+# Reads (read-only): Kivy's metrics database (pipeline table), the after-signing checks log, the Terms agreements database,
+# kivy_pkgs.json (the allowlist) and ledger.jsonl (what upload.mjs already saved). Writes nothing itself (senders.py may add to its senders.json cache).
+# Links: metrics.py (metrics.wh = Kivy's salted wallet hash), senders.py (wallet hash for old records, from Sui GraphQL).
 """Kivy security records -> plain-text records for Walrus Memory (2026-10-24).
 
 One record per transaction Kivy built (metrics.db pipeline: plan, check 1, sign, chain, check 2), one per after-signing
@@ -6,8 +11,8 @@ check with no pipeline row (data/checks.jsonl, older ones), and one for the rule
 Each wallet has its own space on Walrus (namespace wallet-<hash>, hash = Kivy's salted metrics.wh); the rule set is in
 kivy-rules. No raw address leaves the box; old records without a wallet get it from the chain (senders.py). Records already saved
 (ledger.jsonl) are skipped, so this is safe to run again. A transaction waits for its check 2 (at most 2 hours).
-Runs on its own: cron every minute (run.sh; nothing is sent when nothing is new), so a new transaction is on Walrus ~1 minute after check 2.
-  python3 export.py            # print the new records as JSON (upload.mjs reads this)
+Runs on its own: cron every minute (sync_records.sh; nothing is sent when nothing is new), so a new transaction is on Walrus ~1 minute after check 2.
+  python3 export_records.py            # print the new records as JSON (upload.mjs reads this)
 """
 import datetime as dt
 import hashlib
@@ -27,6 +32,7 @@ LEDGER = HERE / 'ledger.jsonl'
 CUSTOMERS = Path('/opt/kivy/data/customers.db')
 
 
+# helpers: j = JSON column or None · when = unix time -> UTC text · verdict = one check's result as a sentence
 def j(v):
     try:
         return json.loads(v) if v else None
@@ -39,6 +45,11 @@ def when(ts):
 
 
 def verdict(c):
+    # check reasons can quote a full address (e.g. a check-1 block naming who would receive a coin): scrub them too
+    return scrub(_verdict(c))
+
+
+def _verdict(c):
     if not c:
         return 'not recorded'
     notes = ' (%s)' % '; '.join(c['notes']) if c.get('notes') else ''
@@ -63,10 +74,13 @@ def moves(m):
     return ', '.join('%s %s %s' % (who(x.get('who')), x.get('amt'), x.get('coin')) for x in (m or [])) or 'none'
 
 
+# the Walrus Memory namespace a record goes into: one per wallet hash
 def space(wh):
     return 'wallet-' + wh if wh else 'wallet-unknown'
 
 
+# one record per transaction Kivy built (pipeline table: plan, simulation, check 1, sign, chain result, check 2);
+# also returns every digest seen, so check_records() skips those
 def pipeline_records(done, chain_lookup=True):
     c = sqlite3.connect('file:/opt/kivy/data/metrics.db?mode=ro', uri=True)
     rows = c.execute('SELECT iid, ts, wh, kind, plan, sim, check1, sign, digest, chain, check2 FROM pipeline ORDER BY ts').fetchall()
@@ -89,6 +103,7 @@ def pipeline_records(done, chain_lookup=True):
     return out, {r[8] for r in rows if r[8]}
 
 
+# older after-signing checks (the checks log) whose transaction has no pipeline row
 def check_records(done, seen):
     out = []
     p = Path('/opt/kivy/data/checks.jsonl')
@@ -154,6 +169,7 @@ def terms_records(done):
     return out
 
 
+# the package allowlist as one record in kivy-rules, saved again only when the file's sha256 changes
 def rules_record(done):
     raw = Path('/opt/kivy/kivy_pkgs.json').read_bytes()
     h = hashlib.sha256(raw).hexdigest()
@@ -168,6 +184,7 @@ def rules_record(done):
     return [{'key': 'rules:' + h, 'digest': None, 'ns': 'kivy-rules', 'text': text}]
 
 
+# ledger keys already saved -> skip; build every kind of record; refuse to print a transaction record holding an address
 def main():
     done = {json.loads(x)['key'] for x in LEDGER.read_text().splitlines() if x.strip()} if LEDGER.exists() else set()
     tx, seen = pipeline_records(done)

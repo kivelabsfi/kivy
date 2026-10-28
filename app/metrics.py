@@ -4,6 +4,16 @@ Anonymous by design: a visitor is a random id from their browser; a wallet addre
 so users can be counted and followed over time (retention) without keeping who they are. Transactions count only
 when the chain confirms them and they match what Kivy built (PTB = one on-chain transaction; actions = the steps in it).
 SQLite in /opt/kivy/data (the service's only writable folder)."""
+# How it runs: imported by site/server.py inside the kivy-site service (:8772); every function runs in the request
+# that calls it. Writers in server.py: POST /api/m (visit, wallet_seen, event, mark_team for team browsers),
+# /api/feedback (feedback), /api/pipeline (pipe: plan, simulation, check 1, the wallet's answer), verify_later()'s
+# background check of each signed transaction (ptb, pipe: chain result + check 2), the chat handler (event 'msg',
+# failure for questions it could not route), failed builds (failure 'build_error'), sweep_caches() (snapshot_today).
+# Readers: /internal/metrics (summary), /internal/public (public_summary), /internal/export (export_rows) — local-only,
+# token-protected routes that the separate kivystats dashboard (kivystats.kivelabs.xyz) calls; tools/stats_weekly.py
+# also calls /internal/metrics. tools/feedback_weekly.py and stats_weekly.py read metrics.db read-only;
+# tools/metrics_backfill.py (ptb) and tools/pipeline_backfill.py (pipe) import this module for one-off backfills.
+# Output files: metrics.db (tables in SCHEMA) and feedback.md (a readable feedback log) in the data folder.
 import hashlib
 import hmac
 import json
@@ -46,6 +56,7 @@ SERVICES = ('swap', 'send', 'lend', 'withdraw', 'claim', 'perps_open', 'perps_cl
             'perps_margin', 'perps_tpsl', 'perps_cancel', 'perps_account')
 
 
+# This thread's SQLite connection (WAL mode, so readers don't block the site); creates the tables and adds later columns.
 def _db():
     c = getattr(_local, 'c', None)
     if c is None:
@@ -62,6 +73,7 @@ def _db():
     return c
 
 
+# The private salt behind wh(), created once in the data folder (never leaves the box, not in backups).
 def _salt():
     f = DATA / 'metrics.salt'
     if not f.exists():
@@ -97,6 +109,7 @@ def redact(text, n=300):
     return t[:n]
 
 
+# A page visit by an anonymous browser id (POST /api/m): one visits row per day, first/last day per visitor.
 def visit(vid):
     if not VID_RE.match(str(vid or '')):
         return
@@ -108,6 +121,7 @@ def visit(vid):
         c.commit()
 
 
+# A wallet connected (POST /api/m): stored only as wh(address), with the visitor id that connected it first.
 def wallet_seen(address, d=None, vid=None):
     if not re.match(r'^0x[0-9a-f]{64}$', str(address or '').lower()):
         return
@@ -122,6 +136,7 @@ def wallet_seen(address, d=None, vid=None):
         c.commit()
 
 
+# One usage event (names in EVENTS), capped per browser and per day.
 def event(vid, name, detail=''):
     if name not in EVENTS or not VID_RE.match(str(vid or '')):
         return
@@ -134,6 +149,7 @@ def event(vid, name, detail=''):
         c.commit()
 
 
+# Where Kivy struggled (a question it could not route, a refused request, a failed build), redacted and capped per day.
 def failure(kind, text, detail='', vid=''):
     with _lock:
         c = _db()
@@ -144,6 +160,7 @@ def failure(kind, text, detail='', vid=''):
         c.commit()
 
 
+# POST /api/feedback: a thumbs up/down under an answer (rating 1/-1) or a Settings message (0); rebuilds feedback.md.
 def feedback(vid, rating, note, ask, answer):
     if not VID_RE.match(str(vid or '')) or rating not in (1, -1, 0):   # 0 = a message from Settings › Feedback (2026-10-23)
         return False
@@ -255,6 +272,7 @@ def mark_team(vid=None, addresses=()):
         c.commit()
 
 
+# Helpers of summary(): retention (D1/D7/D30) and weekly cohorts, for wallets and for visitors.
 def _retention(c, table_first, table_days, key, F=''):
     """Dn = of the users first seen at least n days ago, the share active again exactly n days later (and 'n or later')."""
     today = day()

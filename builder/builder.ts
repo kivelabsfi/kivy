@@ -31,6 +31,77 @@
  * whose on-chain price is stale, the simulation fails and the user is sent to the Suilend app.
  * Older cToken holdings (Kivy's first version) can still be redeemed.
  */
+/*
+ * ── HOW KIVY RUNS THIS FILE ────────────────────────────────────────────────────────────────────────────────────
+ * Service kivy-lend: `tsx builder.ts serve` -> HTTP on localhost:8799 only. Its one caller is Kivy's web server (server.py,
+ * service kivy-site): lend_cli() and grpc_backup() send GET /<cmd>?a=…&a=…, lend_post() sends JSON POSTs. Every answer is
+ * JSON with HTTP 200: {ok: true, …} or {ok: false, error}. `tsx builder.ts <cmd> <args…>` runs one command and prints the same JSON.
+ *   in : a wallet address + what the user asked (market, coin, amount, chain of steps, perps order)
+ *   out: an UNSIGNED transaction (tx JSON; a plain swap's backup comes as a base64 kind), already simulated, plus the plan
+ *        numbers (expected / minimum out, fees, gas) server.py turns into a card. Reads return plain data.
+ *   links: chain.ts (Sui gRPC with failover) · merge.ts (joins two transaction kinds) · ../knowledge/kivy.json (coins, fees,
+ *          slippage tiers, route blocklist) · kivy_pkgs.json (package allowlist) · perps_markets.json (verified perps
+ *          markets, kept by tools/sync_perps_markets.py) · SDKs: Suilend, NAVI lending + vault, Cetus aggregator,
+ *          Bluefin 7k · HTTP: Aftermath router / perpetuals / price-info, Suilend SpringSui APY, Sui GraphQL (coin metadata)
+ *
+ * ── ONE REQUEST (example: swap then lend) ──────────────────────────────────────────────────────────────────────
+ *
+ *   page ──POST /api/tx/swaplend──> server.py (kivy-site)
+ *                                      │ lend_cli('swaplend', address, market, from, to, amount)
+ *                                      v
+ *                      GET localhost:8799/swaplend?a=…        (chains, dust, multi-send: POST via lend_post)
+ *                                      │ HTTP server [S17] -> handle() [S16] -> routed() [S5]
+ *                                      v
+ *                      buildSwapLend() [S6]: routeQuote -> coinWithBalance -> routeTrade -> depositCoin
+ *                                      │ Aftermath router, else Cetus, else Bluefin 7k; Suilend / NAVI SDKs
+ *                                      v
+ *                      simulate() [S4]: dry run on Sui through chain.ts, set the gas budget
+ *                                      │ fails -> {ok:false, error} (a route failure tries the next router first)
+ *                                      v
+ *                      {ok:true, tx: <unsigned tx JSON>, expected_out, min_out, …}
+ *                                      │
+ *                                      v
+ *   server.py adds plan + guard ──> page: check 1 (simulate + compare) ──> wallet signs ──> Sui
+ *                               ──> later GET /tx-facts [S15] = check 2 (what the signed transaction really did)
+ *
+ * ── ENDPOINTS -> CALLER IN server.py ──────────────────────────────────────────────────────────────────────────
+ *   GET /rates lend_rates() · /rates-all lend_rates_all() · /collateral lend_collateral() · /positions-all
+ *       lend_positions_all() · /rewards defi_positions(), /api/lend/rewards · /known-coins ecoins() · /tx-facts check_tx()
+ *   GET /grpc-balances balances() and /grpc-name resolve_recipient(), both via grpc_backup() when Sui GraphQL fails
+ *   GET /tatum-balances, /chain-stats: health checks (tools/watchdog.py, tools/services_weekly.py); /positions: CLI
+ *   GET /build /api/tx/lend (deposit | withdraw), claim_card() (claim) · /swaplend /api/tx/swaplend · /withdrawswap
+ *       /api/tx/withdrawswap
+ *   POST /compose /api/tx/compose · /dust dust_build() · /sendmany /api/tx/sendmany · /swapcheck + /swapalt swap_tx()
+ *       · /kind-calls the allowlist check of a plain swap
+ *   GET /perp-account perp_account() · /perp-params perp_params() · /perp-preview /api/perp/preview, perp_confirm() ·
+ *       /perp-positions /api/perp/positions + wallet / chat readers · /perp-history /api/perp/history
+ *   GET /perp, /perp-order, /perp-limit, /perp-stop, /perp-scale, /perp-twap, /perp-cancel, /perp-close, /perp-margin,
+ *       /perp-tpsl, /perp-tpsl-multi: /api/tx/perp (/perp-cancel also /api/perp/cancel-preview)
+ *   POST /perp-pro-orders /api/perp/pro-orders
+ *
+ * ── SECTIONS (line ranges) ─────────────────────────────────────────────────────────────────────────────────────
+ *   [S1]   101-152   SETUP: imports, the token / package constants, the lending markets Kivy supports, small unit helpers
+ *   [S2]   153-226   MARKET DATA: Suilend markets and NAVI vaults loaded through their SDKs (cached 60 s); rate() = one market's USDC yearly %
+ *   [S3]   227-352   POSITIONS: what a wallet has lent: NAVI reads (15 s), Suilend accounts (one per coin), shared reads, position()
+ *   [S4]   353-519   SIMULATE + PLAIN LEND / WITHDRAW: simulate() (dry run + gas budget), depositCoin() (into Suilend / NAVI / a vault), build() (GET /build)
+ *   [S5]   520-737   SWAP ROUTERS: Aftermath router, then Cetus, then Bluefin 7k (routed / routeQuote / routeTrade), Kivy's swap + lend fees, allowlist
+ *   [S6]   738-1064  MULTI-STEP BUILDS: swap-then-lend (/swaplend), withdraw-then-swap or move (/withdrawswap), any chain of steps (POST /compose)
+ *   [S7]  1065-1163  DUST SWEEP: POST /dust: every coin worth under $0.01 swapped into one coin, one transaction
+ *   [S8]  1164-1212  MULTI-SEND: POST /sendmany: several coins to several addresses, from the wallet or withdrawn from lending
+ *   [S9]  1213-1380  COIN LIST, ALL POSITIONS, REWARDS: /known-coins, /positions-all, /rewards and the claim transaction (build … claim)
+ *   [S10] 1381-1556  PERPS ACCOUNT + GUARD: Aftermath perpetuals API, the perps check against the chain (perpGuard), open / deposit / withdraw (GET /perp)
+ *   [S11] 1557-1634  PERPS MARKET ORDERS: market list, order preview (/perp-preview), market order with optional SL / TP (/perp-order)
+ *   [S12] 1635-1886  PERPS PRO ORDERS: limit, stop, scale, TWAP, cancel, close, take-profit / stop-loss — all GET /perp-* and joined into one transaction
+ *   [S13] 1887-2012  PERPS READS: stop / TWAP order list (POST /perp-pro-orders), positions (/perp-positions), add margin (/perp-margin), history
+ *   [S14] 2013-2186  RATES, COLLATERAL, COIN LOOKUP: /rates-all (every coin on every market), /collateral, slippage tiers, coinOf() (symbol -> type + decimals)
+ *   [S15] 2187-2219  RETRY + CHECK-2 FACTS: staleRetry() for stale Suilend prices; txFacts() = what a signed transaction really did (GET /tx-facts)
+ *   [S16] 2220-2307  COMMAND DISPATCHER: handle(cmd, args): maps every command / GET path to its function above
+ *   [S17] 2308-2402  PROCESS ENTRY: `serve` = the HTTP service on localhost:8799 (POST routes, then GET -> handle); anything else = one CLI command
+ */
+// ══════════════════════════════════════════════════════════════════════════════════════════════════════════════
+// [S1] SETUP
+// imports, the token / package constants, the lending markets Kivy supports, small unit helpers
+// ══════════════════════════════════════════════════════════════════════════════════════════════════════════════
 import { SuiGrpcClient } from '@mysten/sui/grpc';
 import { Transaction, coinWithBalance } from '@mysten/sui/transactions';
 import {
@@ -79,6 +150,10 @@ const toBase = (x: number) => BigInt(Math.round(x * 10 ** DEC));
 const fromBase = (x: any) => Number(x) / 10 ** DEC;
 const ctokenType = (m: Market, t = USDC) => `${CTOKEN_ORIGIN}::reserve::CToken<${m.type}, ${t}>`;
 
+// ══════════════════════════════════════════════════════════════════════════════════════════════════════════════
+// [S2] MARKET DATA
+// Suilend markets and NAVI vaults loaded through their SDKs (cached 60 s); rate() = one market's USDC yearly %
+// ══════════════════════════════════════════════════════════════════════════════════════════════════════════════
 // Pyth's public Hermes now refuses keyless requests; supply rates and cToken values only need
 // Suilend's on-chain cached prices, so reads never ask Hermes.
 const NO_HERMES = {
@@ -88,6 +163,8 @@ const NO_HERMES = {
 
 // ── Suilend markets: heavy to load, kept for a minute each ──
 const _sl = new Map<string, { at: number; v: Promise<{ sl: any; init: any; rewards: any[] }> }>();
+// one Suilend market loaded through its SDK (client, reserves, reward APRs), shared for 60 s; used by rate, position,
+// build, depositCoin, rewards, ratesAll, collateralAll and knownCoins
 function suilend(m: Market) {
   const hit = _sl.get(m.key);
   if (hit && Date.now() - hit.at < 60_000) return hit.v;
@@ -107,6 +184,7 @@ function suilend(m: Market) {
   v.catch(() => _sl.delete(m.key));
   return v;
 }
+// the market's reserve for coin t (default USDC); throws when the market does not list that coin
 function usdcReserve(init: any, t = USDC) {
   const r = init.reserveMap[t] ?? Object.values(init.reserveMap).find((x: any) => normType(x.coinType) === normType(t));
   if (!r) throw new Error('this market does not list ' + (t === USDC ? 'USDC' : t.split('::').pop()));
@@ -123,6 +201,7 @@ function vaults() {
   }
   return _vaults.v;
 }
+// a NAVI vault market's vault object (from NAVI's vault SDK list, refreshed every 60 s)
 async function vaultOf(m: Market) {
   const v = (await vaults()).find((x: any) => x.name === m.vaultName);
   if (!v) throw new Error(m.name + ' is not listed by NAVI right now');
@@ -145,6 +224,10 @@ async function rate(m: Market) {
   return Number(v.apy?.instant ?? v.apy?.target ?? 0) * 100;   // the rate NAVI's app shows
 }
 
+// ══════════════════════════════════════════════════════════════════════════════════════════════════════════════
+// [S3] POSITIONS
+// what a wallet has lent: NAVI reads (15 s), Suilend accounts (one per coin), shared reads, position()
+// ══════════════════════════════════════════════════════════════════════════════════════════════════════════════
 // ── positions (USDC) ──
 // NAVI's lending library caches results FOREVER unless told otherwise, and this service runs non-stop — so a new
 // deposit never showed up (the owner's WBTC on NAVI, 2026-10-20). Positions are read fresh and kept 15 s at most.
@@ -173,6 +256,7 @@ function vaultPositions(addr: string) {
 // Builds run outside this and always read fresh.
 import { AsyncLocalStorage } from 'node:async_hooks';
 const readCtx = new AsyncLocalStorage<Map<string, Promise<any>>>();
+// inside a sharedRead() request: run each keyed lookup once and hand every caller the same promise
 function shared<T>(key: string, f: () => Promise<T>): Promise<T> {
   const ctx = readCtx.getStore();
   if (!ctx) return f();
@@ -198,6 +282,7 @@ async function coinBalance(addr: string, type: string): Promise<number> {
   return all.get(normType(type)) ?? 0;
 }
 
+// the wallet's Suilend accounts on market m: from the shared batch inside a read, else fresh
 function accounts(m: Market, addr: string) {
   if (!readCtx.getStore()) return accountsFresh(m, addr);
   return shared('acc:' + m.key + ':' + addr, async () => (await allAccounts(addr)).get(m.key) ?? []);
@@ -231,6 +316,8 @@ async function accountsFresh(m: Market, addr: string) {
 }
 const obIdxs = (ob: any) => [...new Set([...(ob?.deposits ?? []), ...(ob?.borrows ?? [])].map((d: any) => BigInt(d.reserveArrayIndex)))];
 
+// how much of coin T this wallet has lent on market m. For Suilend it also returns the accounts holding it
+// (single-coin first) and the old cTokens, which build() withdraws from. Callers: build, positionsAll, the positions command
 async function position(m: Market, addr: string, T = USDC, dec = DEC) {
   const fromB = (x: any) => Number(x) / 10 ** dec;
   if (m.protocol === 'suilend') {
@@ -263,6 +350,12 @@ async function position(m: Market, addr: string, T = USDC, dec = DEC) {
   return { usdc: Number(p?.tokenBalance ?? 0), shares: p?.shares ?? '0' };
 }
 
+// ══════════════════════════════════════════════════════════════════════════════════════════════════════════════
+// [S4] SIMULATE + PLAIN LEND / WITHDRAW
+// simulate() (dry run + gas budget), depositCoin() (into Suilend / NAVI / a vault), build() (GET /build)
+// ══════════════════════════════════════════════════════════════════════════════════════════════════════════════
+// dry-runs a built transaction on Sui (chain.ts gRPC) and throws if it would fail; then sets the gas budget and checks the
+// wallet has the SUI for it. Every builder calls this before handing a transaction back. Returns the size in bytes.
 async function simulate(tx: Transaction) {
   const bytes = await tx.build({ client: grpc as any });
   // effects must be asked for: without them Sui returns no status and no gas numbers (2026-10-20: the check and the
@@ -326,6 +419,8 @@ async function depositCoin(tx: Transaction, m: Market, C: Coin, coin: any, addr:
 }
 
 // keep: withdraw into the transaction (for withdraw-then-swap) instead of sending the coin to the wallet
+// GET /build — plain lend (deposit) or withdraw of one coin on one market. Caller: server.py /api/tx/lend (lend_cli).
+// Also the withdrawal step inside withdrawswap, compose and sendmany (keep / into).
 async function build(addr: string, key: string, action: string, amountArg: string, sym = 'USDC', keep?: any[], into?: Transaction) {
   const m = byKey(key);
   const C = await coinOf(key, sym);
@@ -422,10 +517,16 @@ async function build(addr: string, key: string, action: string, amountArg: strin
   return { ok: true, market: key, action, amount, coin: C.sym, coin_type: C.type, decimals: C.dec, tx: await tx.toJSON({ client: grpc as any }), bytes: size };
 }
 
+// ══════════════════════════════════════════════════════════════════════════════════════════════════════════════
+// [S5] SWAP ROUTERS
+// Aftermath router, then Cetus, then Bluefin 7k (routed / routeQuote / routeTrade), Kivy's swap + lend fees, allowlist
+// the plain swap card's check + backup (POST /swapcheck, /swapalt)
+// ══════════════════════════════════════════════════════════════════════════════════════════════════════════════
 // ── swap then lend, one transaction (2026-10-20) ──
 // Aftermath's router appends the swap to our transaction kind (v1/transactions/add-trade, from the coin Kivy
 // built) and returns the output coin as a transaction argument; that coin goes straight into the market, so
 // the user approves once and nothing is left over. If any step fails, nothing happens.
+// Aftermath's router API: 'trade-route' quotes a swap, 'v1/transactions/add-trade' appends it to a transaction kind
 async function afRouter(path: string, body: any) {
   const r = await fetch('https://aftermath.finance/api/router/' + path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
                                                                          signal: AbortSignal.timeout(20_000) })   // a hung router moves on to the backups (review 2026-10-26)
@@ -509,6 +610,7 @@ async function routed<T>(f: () => Promise<T>, only?: string[]): Promise<T> {
   throw first ?? new Error('No swap route');
 }
 let _pkgs = { at: 0, set: new Set<string>() };
+// Kivy's package allowlist (kivy_pkgs.json, re-read every 30 s): the same list server.py and the page enforce
 function allowedPkgs(): Set<string> {
   if (Date.now() - _pkgs.at > 30_000) {
     try {
@@ -633,6 +735,12 @@ async function swapAlt(addr: string, fromType: string, toType: string, base: big
              expected_base: exp.toString(), min_base: (exp * BigInt(Math.floor((1 - slip) * 1_000_000)) / 1_000_000n).toString() };
   }, ['cetus', 'bluefin7k']);
 }
+// ══════════════════════════════════════════════════════════════════════════════════════════════════════════════
+// [S6] MULTI-STEP BUILDS
+// swap-then-lend (/swaplend), withdraw-then-swap or move (/withdrawswap), any chain of steps (POST /compose)
+// ══════════════════════════════════════════════════════════════════════════════════════════════════════════════
+// GET /swaplend — swap coin A into B and lend B on market `key`, one transaction. Caller: server.py /api/tx/swaplend.
+// Runs inside routed(), so a failing route is retried on the next router.
 async function buildSwapLend(addr: string, key: string, fromSym: string, toSym: string, amountArg: string) {
   const m = byKey(key);
   const A = await coinOf('', fromSym), B = await coinOf(key, toSym);
@@ -666,6 +774,7 @@ async function buildSwapLend(addr: string, key: string, fromSym: string, toSym: 
 // never make it short) goes through Aftermath's router and the swapped coin, plus the tiny remainder, go to the wallet.
 // lendTo (a market key): a MOVE — withdraw, swap if the coin changes, and lend it on that market, all one transaction
 // (2026-10-20: "withdraw ssui from suilend and swap all of it into USDC then lend it in NAVI best yield market")
+// GET /withdrawswap — caller: server.py /api/tx/withdrawswap. Uses build(…, keep) for the withdrawal, then a route.
 async function buildWithdrawSwap(addr: string, key: string, sym: string, amountArg: string, toSym: string, lendTo?: string) {
   const keep: any[] = [];
   const w: any = await build(addr, key, 'withdraw', amountArg, sym, keep);
@@ -726,6 +835,8 @@ async function buildWithdrawSwap(addr: string, key: string, sym: string, amountA
 // The coin "in hand" flows from step to step. Before each swap an exact piece is split off (any remainder goes back to
 // the wallet); after a swap the coin is the router's output, and amounts are planned on its guaranteed minimum.
 type Hand = { tx: Transaction; coin: any; C: Coin; est: bigint };   // est = base units the coin holds at least
+// one swap of a chain: split the planned piece off the coin in hand, append the route, and return the router's output
+// (planned on its guaranteed minimum) as the new coin in hand
 async function swapInHand(h: Hand, B: Coin, addr: string): Promise<Hand & { exp: bigint }> {
   const base = h.est;
   if (base <= 0n) throw new Error('Too little to swap');
@@ -747,6 +858,8 @@ async function swapInHand(h: Hand, B: Coin, addr: string): Promise<Hand & { exp:
   return { tx: t2, coin: r.coinOutId, C: B, est: min, exp };
 }
 
+// POST /compose — caller: server.py /api/tx/compose (lend_post). Source (wallet / withdraw / perps_out / dust) -> optional
+// "plus" from the wallet -> a fan-out split OR up to 2 swaps -> 1-4 sinks (lend / send / keep / perps), then simulate.
 async function buildCompose(addr: string, spec: any) {
   const src = spec?.source ?? {}, swaps: any[] = spec?.swaps ?? [], sinks: any[] = spec?.sinks ?? [];
   if (swaps.length > 2) throw new Error('At most 2 swaps in one transaction');
@@ -949,9 +1062,14 @@ async function buildCompose(addr: string, spec: any) {
            tx: await h.tx.toJSON({ client: grpc as any }), bytes: size };
 }
 
+// ══════════════════════════════════════════════════════════════════════════════════════════════════════════════
+// [S7] DUST SWEEP
+// POST /dust: every coin worth under $0.01 swapped into one coin, one transaction
+// ══════════════════════════════════════════════════════════════════════════════════════════════════════════════
 // ── dust sweep (2026-10-25): the coins worth under $0.01 that the wallet hides, swapped into ONE coin in ONE transaction.
 // Each coin's objects are merged and spent whole, and the emptied object is deleted, so Sui refunds its storage deposit.
 // Every route is asked for first: a coin the router can't swap is left where it is, never half-built into the transaction. ──
+// POST /dust — caller: server.py dust_build() (/api/tx/dust); also the "dust" source of a compose chain
 async function buildDust(addr: string, toSym: string, items: any[], hand = false) {   // hand: also return the swept coin, unsent, for a chain
   const B = await coinOf('', toSym);
   const SUI_T = normType('0x2::sui::SUI');
@@ -988,11 +1106,14 @@ async function buildDust(addr: string, toSym: string, items: any[], hand = false
   }
 }
 
+// the package allowlist for the dust sweep (kivy_pkgs.json, package ids only)
 function dustAllow(): Set<string> {
   try { return new Set(JSON.parse(readFileSync('/opt/kivy/kivy_pkgs.json', 'utf8')).packages.map((p: string) => normType(p + '::a::b').split('::')[0])); }
   catch { return new Set(); }
 }
 
+// one sweep: merge each coin's objects, split all of it off, destroy the empty object, append its route, check every
+// program against the allowlist, merge the outputs. A bad leg throws {badLeg} so buildDust drops that coin and retries.
 async function dustTx(addr: string, B: Coin, legs: any[], skipped: any[], hand = false): Promise<any> {
   const tx = new Transaction(); tx.setSender(addr);
   for (const L of legs) {
@@ -1040,9 +1161,14 @@ async function dustTx(addr: string, B: Coin, legs: any[], skipped: any[], hand =
            gas: G ?? null, tx: await tx2.toJSON({ client: grpc as any }), bytes: size };
 }
 
+// ══════════════════════════════════════════════════════════════════════════════════════════════════════════════
+// [S8] MULTI-SEND
+// POST /sendmany: several coins to several addresses, from the wallet or withdrawn from lending
+// ══════════════════════════════════════════════════════════════════════════════════════════════════════════════
 // ── multi-send (2026-10-23): several coins to several addresses in ONE transaction. Each line comes from the
 // wallet, or from a lending market (withdrawn here, then sent). Lines from the same market + coin share one withdrawal;
 // the last line of a group takes what is left of it, so a tiny rounding gap on Suilend can't fail the transaction. ──
+// POST /sendmany — caller: server.py /api/tx/sendmany (the Send card)
 async function buildSendMany(addr: string, lines: any[]) {
   if (!Array.isArray(lines) || !lines.length || lines.length > 12) throw new Error('Send 1 to 12 transfers at a time');
   const tx = new Transaction(); tx.setSender(addr);
@@ -1084,9 +1210,14 @@ async function buildSendMany(addr: string, lines: any[]) {
   return { ok: true, sendmany: true, plan, tx: await tx.toJSON({ client: grpc as any }), bytes: size };
 }
 
+// ══════════════════════════════════════════════════════════════════════════════════════════════════════════════
+// [S9] COIN LIST, ALL POSITIONS, REWARDS
+// /known-coins, /positions-all, /rewards and the claim transaction (build … claim)
+// ══════════════════════════════════════════════════════════════════════════════════════════════════════════════
 // ── every coin the markets list (lending versions, NAVI/Suilend reserves, reward coins): Kivy can swap / send / show
 // these, and nothing else — a protocol listing is the filter against airdropped junk tokens ──
 let _known: { at: number; v: Promise<any[]> } | null = null;
+// GET /known-coins — caller: server.py ecoins(). Also coinOf()'s last resort. Rebuilt once an hour.
 function knownCached() {
   if (!_known || Date.now() - _known.at > 3_600_000) { const v = knownCoins(); _known = { at: Date.now(), v }; v.catch(() => { _known = null; }); }
   return _known.v;
@@ -1113,6 +1244,7 @@ async function knownCoins() {
 }
 
 // ── everything this wallet has lent, any coin (for the 'You lent' column and withdrawals) ──
+// GET /positions-all — caller: server.py lend_positions_all(). Runs inside sharedRead() (see shared()).
 async function positionsAll(addr: string) {
   const rows = await rowsAll();
   const label = (t: string) => { const r = rows.find((x) => x.type && normType(x.type) === normType(t)); return r ? { asset: r.asset, token: r.token ?? r.asset } : null; };
@@ -1153,6 +1285,7 @@ async function positionsAll(addr: string) {
 
 // ── rewards: what each market has paid out that the user can claim ──
 const _meta = new Map<string, Promise<{ symbol: string; decimals: number }>>();
+// a coin's symbol + decimals from Sui GraphQL (kept for the life of the process)
 function coinMeta(t: string) {
   if (!_meta.has(t)) _meta.set(t, (async () => {
     const q = { query: `{ coinMetadata(coinType: "${t}") { symbol decimals } }` };
@@ -1162,6 +1295,7 @@ function coinMeta(t: string) {
   })());
   return _meta.get(t)!;
 }
+// USD prices from Aftermath's price-info API, for rewards the protocol SDK did not price
 async function usdPrices(types: string[]) {
   if (!types.length) return {} as Record<string, number>;
   try {
@@ -1171,6 +1305,7 @@ async function usdPrices(types: string[]) {
 }
 type Reward = { market: string; coinType: string; symbol: string; amount: number; usd: number; raw: any };
 
+// claimable rewards, one reader per protocol: Suilend SDK (per account), NAVI lending, NAVI vaults
 async function suilendRewards(m: Market, addr: string): Promise<Reward[]> {
   const caps: any[] = await SuilendClient.getObligationOwnerCaps(addr, [m.type!], grpc as any);
   if (!caps?.length) return [];
@@ -1202,6 +1337,7 @@ async function vaultRewards(m: Market, addr: string): Promise<Reward[]> {
     return { market: m.key, coinType: t, symbol: md.symbol, amount: Number(BigInt(r.claimable)) / 10 ** md.decimals, usd: 0, raw: r };
   }));
 }
+// GET /rewards — callers: server.py defi_positions() and /api/lend/rewards. only = a market key, p-suilend / p-navi, or all
 async function rewards(addr: string, only?: string) {
   const jobs: Promise<Reward[]>[] = [];
   for (const m of [...MARKETS, ...SUI_VAULT_MARKETS]) {                 // NAVI's SUI vaults pay rewards too
@@ -1216,6 +1352,7 @@ async function rewards(addr: string, only?: string) {
   return all;
 }
 
+// GET /build with action "claim" — one transaction claiming every listed reward. Caller: server.py claim_card()
 async function buildClaim(addr: string, only: string) {
   const rs = await rewards(addr, only);
   if (!rs.length) throw new Error('No rewards to claim right now');
@@ -1241,11 +1378,16 @@ async function buildClaim(addr: string, only: string) {
            tx: await tx.toJSON({ client: grpc as any }) };
 }
 
+// ══════════════════════════════════════════════════════════════════════════════════════════════════════════════
+// [S10] PERPS ACCOUNT + GUARD
+// Aftermath perpetuals API, the perps check against the chain (perpGuard), open / deposit / withdraw (GET /perp)
+// ══════════════════════════════════════════════════════════════════════════════════════════════════════════════
 // ── Aftermath perpetuals: the user's account and its USDC collateral ──
 // Aftermath's API returns transaction *kinds*; we add sender + gas, simulate, and hand back
 // the full transaction. Deposits use a coin Kivy builds (coinWithBalance) passed in as
 // depositCoinArg, so USDC in the address balance works too.
 const AF = 'https://aftermath.finance/api/perpetuals/';
+// POST to Aftermath's perpetuals API (AF + path); returns its JSON or throws 'Aftermath: …'
 async function af(path: string, body: any) {
   const r = await fetch(AF + path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
   const t = await r.text();
@@ -1259,6 +1401,8 @@ function coinArg(resolved: any) {
   for (let i = resolved.commands.length - 1; i >= 0; i--) if (resolved.commands[i].SplitCoins) return { NestedResult: [i, 0] };
   return { Result: resolved.commands.length - 1 };
 }
+// GET /perp-account — the wallet's USDC perps account: id, cap, free collateral. Caller: server.py perp_account().
+// Every perps builder starts here.
 async function perpAccount(addr: string) {
   const own: any = await af('accounts/owned', { walletAddress: addr });
   const a = (own.accountCaps ?? []).find((x: any) => String(x.collateralCoinType).endsWith('::usdc::USDC') && !x.isAgent && String(x.walletAddress ?? addr) === addr)
@@ -1273,11 +1417,12 @@ async function perpAccount(addr: string) {
 // ── perps check (security audit 2026-10-27, finding 3) ──
 // Aftermath's API writes every perps transaction. Before one reaches the wallet, Kivy runs it and reads what the CHAIN says it
 // does — the events and the money moving — and compares that with what the user asked: the market (from the on-chain-verified
-// list in perps_markets.json, kept by tools/perps_markets_sync.py), the account, long or short, the size and the leverage,
+// list in perps_markets.json, kept by tools/sync_perps_markets.py), the account, long or short, the size and the leverage,
 // and that nothing leaves the wallet but gas (or the deposit). Any mismatch is refused and logged ("kivy perps refused:"),
 // which wakes the alert and the fixer. Reading events instead of raw arguments survives Aftermath re-ordering them.
 const perpCtx = new AsyncLocalStorage<{ cmd: string; args: string[] }>();
 let _ptab: { at: number; v: any } = { at: 0, v: null };
+// perps_markets.json (verified market + package ids), re-read every 60 s
 function perpTable() {
   if (Date.now() - _ptab.at > 60_000) {
     try { _ptab = { at: Date.now(), v: JSON.parse(readFileSync(new URL('./perps_markets.json', import.meta.url), 'utf8')) }; }
@@ -1285,10 +1430,12 @@ function perpTable() {
   }
   return _ptab.v;
 }
+// log the refusal (the alert watches for "kivy perps refused:") and stop the build
 function perpRefuse(why: string, cmd: string): never {
   console.error(`kivy perps refused: ${why} | ${cmd}`);
   throw new Error(`This perps transaction did not match your request, so nothing was prepared (${why}). Kivy has been alerted.`);
 }
+// the perps check described above; runs on every perps transaction through finishKind()
 async function perpGuard(tx: Transaction, addr: string) {
   const ctx = perpCtx.getStore(), cmd = ctx?.cmd ?? 'perp';
   let a = ctx?.args ?? [];
@@ -1363,6 +1510,7 @@ async function perpGuard(tx: Transaction, addr: string) {
     }
   }
 }
+// an Aftermath transaction kind -> the full transaction for the wallet: sender, perpGuard, simulate
 async function finishKind(kindB64: string, addr: string) {
   const tx = Transaction.fromKind(kindB64);
   tx.setSender(addr);
@@ -1370,6 +1518,7 @@ async function finishKind(kindB64: string, addr: string) {
   await simulate(tx);                                   // never hand the user a transaction that would fail
   return tx.toJSON({ client: grpc as any });
 }
+// GET /perp — open the perps account, deposit or withdraw USDC collateral. Caller: server.py /api/tx/perp
 async function buildPerp(addr: string, action: string, amountArg: string) {
   const acct: any = await perpAccount(addr);
   if (action === 'open') {
@@ -1405,8 +1554,13 @@ async function buildPerp(addr: string, action: string, amountArg: string) {
   throw new Error('perp action must be open, deposit or withdraw');
 }
 
+// ══════════════════════════════════════════════════════════════════════════════════════════════════════════════
+// [S11] PERPS MARKET ORDERS
+// market list, order preview (/perp-preview), market order with optional SL / TP (/perp-order)
+// ══════════════════════════════════════════════════════════════════════════════════════════════════════════════
 // ── perps orders: preview + market order (optional stop-loss / take-profit) ──
 let _pmk: { at: number; v: Record<string, any> } | null = null;
+// Aftermath's market for a symbol (BTC, SUI…); the market list is kept for an hour
 async function perpMarket(sym: string) {
   if (!_pmk || Date.now() - _pmk.at > 3600_000) {
     const r: any = await af('all-markets', { collateralCoinType: USDC });
@@ -1422,6 +1576,8 @@ function baseSize(m: any, base: number) {
   const raw = Math.floor(base * SIZE_DEC / lot) * lot;    // round down to the lot size
   return BigInt(raw);
 }
+// GET /perp-preview — size, price, margin, fees and liquidation price of a market order, from Aftermath's preview API.
+// Callers: server.py /api/perp/preview, perp_confirm(); also buildOrder().
 async function preview(addr: string, sym: string, side: number, usd: number, lev: number) {
   const m = await perpMarket(sym);
   const px: any = await af('markets/prices', { marketIds: [m.objectId] });
@@ -1451,6 +1607,7 @@ async function preview(addr: string, sym: string, side: number, usd: number, lev
            max_lev: Math.round(1 / Number(m.marketParams.marginRatioInitial)), min_usd: Number(m.marketParams.minOrderUsdValue ?? 1),
            has_position: !!pv.hasPosition || await hasPos(acct, m.objectId) };
 }
+// GET /perp-order — market order (+ optional stop-loss / take-profit) as one transaction. Caller: server.py /api/tx/perp
 async function buildOrder(addr: string, sym: string, side: number, usd: number, lev: number, slip: number, sl?: number, tp?: number) {
   const acct: any = await perpAccount(addr);
   if (!acct.has) throw new Error('Open an Aftermath perps account first');
@@ -1475,6 +1632,10 @@ async function buildOrder(addr: string, sym: string, side: number, usd: number, 
   const r = { txKind: kind };
   return { ok: true, action: 'order', preview: p, steps, tx: await finishKind(r.txKind, addr) };
 }
+// ══════════════════════════════════════════════════════════════════════════════════════════════════════════════
+// [S12] PERPS PRO ORDERS
+// limit, stop, scale, TWAP, cancel, close, take-profit / stop-loss — all GET /perp-* and joined into one transaction
+// ══════════════════════════════════════════════════════════════════════════════════════════════════════════════
 // ── pro orders: limit, stop market / stop limit, scale, TWAP; plus cancel and close ──
 const PX_DEC = 1e9;                                       // order prices = price × 1e9, rounded to the tick size
 function orderPrice(m: any, price: number) {
@@ -1494,6 +1655,7 @@ async function topUpKind(addr: string, acct: any, amount: number, what = 'order'
   throw new Error(`Not enough USDC in your perps account: this ${what} needs ${f6(amount)} USDC more (free ${f6(free)}). ` +
                   `Deposit into perps first — say "deposit to perps" — or lower the size / raise leverage.`);
 }
+// join Aftermath transaction kinds into one (merge.ts), then finishKind(); steps = the Move functions it calls
 async function joinParts(parts: string[], addr: string) {
   let kind = parts[0];
   for (const next of parts.slice(1)) {
@@ -1515,6 +1677,8 @@ async function hasPos(acct: any, marketId: string) {
   const r: any = await af('accounts/positions', { accountIds: [acct.accountId] });
   return (r.accounts?.[0]?.positions ?? []).some((x: any) => x.marketId === marketId);
 }
+// GET /perp-limit, /perp-stop, /perp-scale, /perp-twap — caller: server.py /api/tx/perp. Each one asks Aftermath for the
+// order's transaction kind, refuses when the perps account is short (topUpKind), then joinParts().
 async function buildLimit(addr: string, sym: string, side: number, usd: number, lev: number, price: number, postOnly: boolean, sl?: number, tp?: number) {
   const acct = await needAccount(addr); const m = await perpMarket(sym);
   const size = baseSize(m, usd / price), px = orderPrice(m, price);
@@ -1597,6 +1761,8 @@ async function idleMarketKinds(acct: any, exceptOrders: { marketId?: string; ids
   }
   return { kinds, total, available: Number(a.availableCollateral ?? 0) };
 }
+// GET /perp-cancel — cancel a limit / stop / TWAP order, release its idle margin, optionally withdraw to the wallet.
+// Callers: server.py /api/tx/perp and /api/perp/cancel-preview.
 async function buildCancel(addr: string, kind: string, sym: string, id: string, withdraw = false) {
   const acct = await needAccount(addr);
   let r: any;
@@ -1625,6 +1791,7 @@ async function buildCancel(addr: string, kind: string, sym: string, id: string, 
   }
   return { ok: true, action: 'cancel', released: idle?.total ?? 0, withdrawn: out, ...(await joinParts(parts, addr)) };
 }
+// the open position on sym (account, market, position), or a clear error
 async function openPos(addr: string, sym: string) {
   const acct = await needAccount(addr); const m = await perpMarket(sym);
   const r: any = await af('accounts/positions', { accountIds: [acct.accountId] });
@@ -1633,6 +1800,7 @@ async function openPos(addr: string, sym: string) {
   return { acct, m, pos };
 }
 // close all of a position (frac 1) or part of it (0 < frac < 1, rounded down to the market's lot size)
+// GET /perp-close — caller: server.py /api/tx/perp (a reduce-only market order on the other side)
 async function buildClose(addr: string, sym: string, slip: number, frac = 1) {
   if (!(frac > 0 && frac <= 1)) throw new Error('Close between 1% and 100% of the position');
   const { acct, m, pos } = await openPos(addr, sym);
@@ -1651,6 +1819,7 @@ async function buildClose(addr: string, sym: string, slip: number, frac = 1) {
 }
 // take-profit / stop-loss on a position that is already open (whole size, reduce-only, index price)
 // TP1 can close part of the position (frac) and TP2 the rest; SL always covers the whole position (2026-10-21)
+// GET /perp-tpsl — caller: server.py /api/tx/perp
 async function buildTpSl(addr: string, sym: string, sl: number, tp: number, frac = 1, tp2 = 0) {
   if (!(sl > 0 || tp > 0)) throw new Error('Give a stop-loss or take-profit price');
   if (!(frac > 0 && frac <= 1)) throw new Error('The take-profit share must be between 1% and 100%');
@@ -1682,6 +1851,7 @@ async function buildTpSl(addr: string, sym: string, sl: number, tp: number, frac
 }
 
 // up to 3 take-profits, each closing its own share of the position, plus one stop-loss for all of it — one transaction (2026-10-21)
+// GET /perp-tpsl-multi — caller: server.py /api/tx/perp
 async function buildTpSlMulti(addr: string, sym: string, sl: number, tps: [number, number][]) {
   tps = (tps || []).filter((t) => t && t[0] > 0).slice(0, 3);
   if (!(sl > 0 || tps.length)) throw new Error('Give a stop-loss or take-profit price');
@@ -1714,8 +1884,13 @@ async function buildTpSlMulti(addr: string, sym: string, sl: number, tps: [numbe
   return { ok: true, action: 'tpsl', mark, side: long ? 'long' : 'short', base: Number(size) / SIZE_DEC, tp_bases: sizes, ...(await joinParts(parts, addr)) };
 }
 
+// ══════════════════════════════════════════════════════════════════════════════════════════════════════════════
+// [S13] PERPS READS
+// stop / TWAP order list (POST /perp-pro-orders), positions (/perp-positions), add margin (/perp-margin), history
+// ══════════════════════════════════════════════════════════════════════════════════════════════════════════════
 // Stop and TWAP orders are private on Aftermath: listing them needs the wallet's signature over the
 // fixed message "Aftermath Terms and Conditions" (a free personal-message signature, not a transaction).
+// POST /perp-pro-orders — caller: server.py /api/perp/pro-orders (body: address, bytes, signature)
 async function perpProOrders(addr: string, bytes: string, signature: string) {
   const acct = await needAccount(addr);
   if (!_pmk) await perpMarket('BTC').catch(() => null);
@@ -1740,6 +1915,8 @@ function idPrice(id: any, side: number) {
   const hi = BigInt(String(id).replace('n', '')) >> 64n;
   return Number(side === 0 ? (2n ** 64n - 1n - hi) : hi) / 1e9;
 }
+// GET /perp-positions — open positions, their orders and funding since opening. Callers: server.py /api/perp/positions
+// and the wallet / chat readers (wallet_snapshot, perp_manage, perp_widget, market_overview…); server.py caches it 15 s.
 async function perpPositions(addr: string) {
   const acct: any = await perpAccount(addr);
   if (!acct.has) return { has: false, positions: [] };
@@ -1778,6 +1955,7 @@ async function perpPositions(addr: string) {
 }
 
 // add margin to an open position: allocate free account collateral to that market (top up from the wallet first if short)
+// GET /perp-margin — caller: server.py /api/tx/perp
 async function buildMargin(addr: string, sym: string, amount: number) {
   if (!(amount > 0)) throw new Error('Enter an amount of USDC to add');
   const acct = await needAccount(addr); const m = await perpMarket(sym);
@@ -1795,6 +1973,7 @@ async function buildMargin(addr: string, sym: string, amount: number) {
   return { ok: true, action: 'margin', symbol: sym, amount, deposit: short > 0 ? short : 0, ...j };
 }
 // filled trades + deposits / withdrawals, newest first (public, by account id)
+// GET /perp-history — caller: server.py /api/perp/history
 async function perpHistory(addr: string) {
   const acct: any = await perpAccount(addr);
   if (!acct.has) return { has: false, trades: [], transfers: [] };
@@ -1831,6 +2010,10 @@ async function perpHistory(addr: string) {
         usd: x.collateralChangeUsd })) };
 }
 
+// ══════════════════════════════════════════════════════════════════════════════════════════════════════════════
+// [S14] RATES, COLLATERAL, COIN LOOKUP
+// /rates-all (every coin on every market), /collateral, slippage tiers, coinOf() (symbol -> type + decimals)
+// ══════════════════════════════════════════════════════════════════════════════════════════════════════════════
 // ── rates for every coin Kivy knows (2026-10-19); each row also carries the coin type + decimals Kivy lends with ──
 const KIVY_JSON: any = JSON.parse(readFileSync(new URL('../knowledge/kivy.json', import.meta.url), 'utf8'));
 const KIVY_COINS: Record<string, any> = KIVY_JSON.coins ?? {};
@@ -1866,6 +2049,8 @@ async function lstApys(): Promise<Record<string, number>> {
   return v;
 }
 const SHOW_VOLO = false;
+// GET /rates-all — one row per (market, coin): yearly %, coin type, decimals. Caller: server.py lend_rates_all().
+// rowsAll() keeps it 5 minutes for coinOf() and positionsAll().
 async function ratesAll() {
   const stake = await lstApys().catch(() => ({} as Record<string, number>));
   const assets = Object.entries(KIVY_COINS).map(([sym, c]: any) => ({ sym, type: normType(c.type) }));
@@ -1944,6 +2129,7 @@ async function ratesAll() {
 // if it crashes faster than liquidations can sell it, the market takes bad debt. A coin counts when its LTV > 0.
 // NAVI's managed vaults publish no collateral list, only NAVI's own risk level.
 const webIcon = (u: any) => (typeof u === 'string' && /^https:\/\//.test(u) && u.length < 400 ? u : null);   // no inline data: icons
+// GET /collateral — caller: server.py lend_collateral()
 async function collateralAll() {
   const out: Record<string, any> = {};
   const num = (x: any) => { const n = Number(String(x ?? 0)); return Number.isFinite(n) ? n : 0; };
@@ -1998,6 +2184,10 @@ async function coinOf(key: string, sym: string): Promise<Coin> {
   return { type: normType(r.type), dec: Number(r.dec), sym: r.token };
 }
 
+// ══════════════════════════════════════════════════════════════════════════════════════════════════════════════
+// [S15] RETRY + CHECK-2 FACTS
+// staleRetry() for stale Suilend prices; txFacts() = what a signed transaction really did (GET /tx-facts)
+// ══════════════════════════════════════════════════════════════════════════════════════════════════════════════
 // A Suilend withdrawal whose on-chain price is stale: wait and build again (2 more tries, 20 s apart)
 async function staleRetry<T>(f: () => Promise<T>): Promise<T> {
   for (let i = 0; ; i++) {
@@ -2010,6 +2200,7 @@ async function staleRetry<T>(f: () => Promise<T>): Promise<T> {
 }
 
 // ── what a signed transaction really did (for Kivy's after-the-fact check against the plan) ──
+// GET /tx-facts — caller: server.py check_tx() (check 2: the landed transaction against the plan). Read-only.
 async function txFacts(digest: string) {
   const r: any = await (grpc as any).core.getTransaction({ digest, include: { effects: true, balanceChanges: true, transaction: true } });
   const t = r.Transaction ?? r.FailedTransaction ?? r.transaction ?? r;
@@ -2026,8 +2217,15 @@ async function txFacts(digest: string) {
            calls: [...new Set((t.transaction?.commands ?? []).filter((c: any) => c.MoveCall).map((c: any) => normType(c.MoveCall.package + '::a::b').split('::')[0] + '::' + c.MoveCall.module + '::' + c.MoveCall.function))] };
 }
 
+// ══════════════════════════════════════════════════════════════════════════════════════════════════════════════
+// [S16] COMMAND DISPATCHER
+// handle(cmd, args): maps every command / GET path to its function above
+// ══════════════════════════════════════════════════════════════════════════════════════════════════════════════
+// run f; an error becomes {error} so one market failing never fails a whole list
 const settle = async (f: () => Promise<any>) => { try { return await f(); } catch (e: any) { if (process.env.KIVY_DEBUG) console.error("settle:", e?.message ?? e); return { error: String(e?.message ?? e).slice(0, 200) }; } };
 
+// One name per command: the CLI (`tsx builder.ts <cmd> <args…>`) and every GET endpoint (/<cmd>?a=…&a=…) land here.
+// Builders that swap are wrapped in routed() (router failover); Suilend withdrawals in staleRetry().
 async function handle(cmd: string, args: string[]) {
   if (cmd === 'rates') {
     const rs = await Promise.all(MARKETS.map((m) => settle(async () => ({ total_apr: await rate(m) }))));
@@ -2107,9 +2305,13 @@ async function handle(cmd: string, args: string[]) {
   return { ok: false, error: 'usage: rates | positions <addr> | rewards <addr> [market] | build <addr> <market|all> <deposit|withdraw|claim> <amount|all> | serve' };
 }
 
+// ══════════════════════════════════════════════════════════════════════════════════════════════════════════════
+// [S17] PROCESS ENTRY
+// `serve` = the HTTP service on localhost:8799 (POST routes, then GET -> handle); anything else = one CLI command
+// ══════════════════════════════════════════════════════════════════════════════════════════════════════════════
 // One request's stray error must never stop the builder for everyone (2026-10-24: it exited ~70 times since 10-20 on a
 // coin-metadata 503, a failed fetch, a wallet without enough USDC — each a promise nothing awaited). Log it, keep serving;
-// the request itself still gets its own error. kivy_watch counts these lines.
+// the request itself still gets its own error. watchdog counts these lines.
 process.on('unhandledRejection', (e: any) => console.error('kivy-lend: stray error (kept running):', String(e?.stack ?? e?.message ?? e).split('\n').slice(0, 3).join(' | ')));
 process.on('uncaughtException', (e: any) => console.error('kivy-lend: stray exception (kept running):', String(e?.stack ?? e?.message ?? e).split('\n').slice(0, 3).join(' | ')));
 const [cmd, ...args] = process.argv.slice(2);
@@ -2124,6 +2326,9 @@ if (cmd === 'serve') {
     if (inflight >= 16) { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: false, error: 'The transaction builder is busy — try again in a moment.' })); return; }
     inflight++; res.on('close', () => { inflight--; });
     const u = new URL(req.url ?? '/', 'http://x');
+    // POST routes (JSON body; server.py lend_post()): /compose <- /api/tx/compose · /swapcheck + /swapalt <- swap_tx()
+    // (/api/tx/swap) · /kind-calls <- the allowlist check of a plain swap's kind · /dust <- dust_build() · /sendmany <-
+    // /api/tx/sendmany · /perp-pro-orders <- /api/perp/pro-orders. Bodies are size-capped and the address checked first.
     if (req.method === 'POST' && u.pathname === '/compose') {               // a chain of steps -> one transaction
       let raw = ''; for await (const ch of req) { raw += ch; if (raw.length > 10000) break; }
       let o: any;
@@ -2176,6 +2381,8 @@ if (cmd === 'serve') {
       catch (e: any) { o = { ok: false, error: String(e?.message ?? e).slice(0, 300) }; }
       res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(o)); return;
     }
+    // every other path is a GET command: /<cmd>?a=<address or 0x0>&a=… -> handle(cmd, args) (server.py lend_cli / grpc_backup).
+    // Args must match a short character set and the first one must be an address (or 0x0, or a digest for /tx-facts).
     const a = u.searchParams.getAll('a');
     let o: any;
     try {

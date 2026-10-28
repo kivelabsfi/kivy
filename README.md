@@ -71,16 +71,12 @@ message ─► reader (exact rules) ─unclear─► AI (tool calls only)
 - No percentage fees.
 - After a perps account opens, Kivy offers (once, optionally) to link its Aftermath referral code with one free signature.
 
-## Total Recall (Tatum × Walrus, 20 Oct – 10 Nov 2026)
-
-Kivy existed before the hackathon. Built during the window:
+## Walrus and Tatum
 
 | What | Where |
 |---|---|
-| **Walrus Memory = Kivy's security memory.** Every transaction's checks (plan, check 1, chain result, check 2) and the rule set (the program allowlist) are written to Walrus Memory: verdict + hashed wallet only, so records are tamper-proof and checkable without exposing anyone. Corrections are new records, never edits. | `walrus/` (`export.py` → `upload.mjs`, `recall.mjs`) |
-| **Tatum as the backup chain and price source.** When Sui GraphQL fails, reads and transaction builds fail over to Tatum's Sui gRPC; wallet values fall back to Tatum prices. Display only: prices never feed a safety check. | `lend/chain.ts`, `app/server.py` |
-| Security audit (Cloudflare security-audit method) and fixes: router drains, upgrade commands, object moves, account-balance spends, on-chain swap minimums, .sui name binding, perps transactions checked against the chain, abuse limits | `lend/lend.ts` (`perpGuard`), `app/server.py`, and the page's check 1 (see below) |
-| Backup swap routers (Aftermath → Cetus → Bluefin 7k), plain-English multi-step plans and sentences, multi-send | `lend/lend.ts`, `app/server.py` |
+| **Walrus = Kivy's security memory.** Every transaction's checks (plan, check 1, chain result, check 2) and the rule set (the program allowlist) are written to Walrus as records: verdict plus a hashed wallet only, so they are tamper-proof and anyone can check them without seeing who signed. Corrections are new records, never edits. | `walrus/` (`export_records.py` → `upload.mjs`, `recall.mjs`) |
+| **Tatum = backup chain and price source.** When Sui GraphQL fails, reads and transaction builds fail over to Tatum's Sui gRPC, and wallet values fall back to Tatum prices. Display only: prices never feed a safety check. | `builder/chain.ts`, `app/server.py` |
 
 ## The web page
 
@@ -95,11 +91,11 @@ program outside the allowlist (`app/kivy_pkgs.json`), or if it would publish or 
 | Part | Path in this repo | Runs as |
 |---|---|---|
 | Rules, cards, transaction API, sign-in | `app/server.py`, `app/accounts.py` | `kivy-site` (Python stdlib HTTP server, :8772) |
-| Transaction builder | `lend/lend.ts` (TypeScript, `@mysten/sui`, Suilend / NAVI / Aftermath SDKs) | `kivy-lend` (local only, :8799) |
+| Transaction builder | `builder/builder.ts` (TypeScript, `@mysten/sui`, Suilend / NAVI / Aftermath SDKs) | `kivy-lend` (local only, :8799) |
 | AI brain | `brain.py` (trimmed): the 10 tools the AI may request (read data or make a PLAN — none can sign or send), the tool-calling loop where Kivy's code runs every tool, and the leak filter. The prompt, model choices and keys are private. | called by the site |
 | What Kivy knows and says | `knowledge/kivy.json` (rules, coins, copy, FAQ, fee switch); the AI's own prompt and tool notes are private | read fresh on every call |
 | Metrics | `app/metrics.py`: SQLite, wallets stored as salted hashes, no addresses | inside the site |
-| Tools | `tools/perps_markets_sync.py` (perps markets verified on chain, hourly) | cron |
+| Tools | `tools/sync_perps_markets.py` (perps markets verified on chain, hourly) | cron |
 
 Chain reads go through **Sui GraphQL** first, with JSON-RPC only as a fallback.
 
@@ -107,7 +103,7 @@ Chain reads go through **Sui GraphQL** first, with JSON-RPC only as a fallback.
 
 ```bash
 # builder
-cd lend && npm ci && npx tsx lend.ts serve      # serves 127.0.0.1:8799
+cd builder && npm ci && npx tsx builder.ts serve      # serves 127.0.0.1:8799
 
 # site
 python3 app/server.py                          # serves 127.0.0.1:8772
@@ -119,10 +115,11 @@ python3 app/server.py                          # serves 127.0.0.1:8772
 - **Runtime data:** `app/data/` is created at runtime and is **not** in this repo. It holds the internal token, the
   metrics salt and database, chats and check logs.
 
-## Never commit
+## Security
 
-`app/data/`, `.env` files, anything holding keys or tokens, `node_modules/`, `*.bak*`. The `.gitignore` covers these.
-A secret committed once stays in the history even after deletion, so check before pushing.
+- No keys, tokens or user data are in this repository: runtime data lives in `app/data/` and keys come from the service
+  environment, both outside git (see `.gitignore`).
+- Found a security problem? Email **info@kivelabs.xyz** rather than opening a public issue.
 
 ## Docs
 

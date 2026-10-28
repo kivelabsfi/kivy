@@ -7,6 +7,15 @@ their own file, named by a hash of the address; the server only ever opens the f
 for the address inside a valid cookie, so nobody can read anyone else's chats.
 (Google/zkLogin sign-in was removed the same day; verify_google is kept unused.)
 """
+# How it runs: imported by site/server.py inside the kivy-site service (:8772); nothing here runs on its own.
+# Routes in server.py that use it: /api/auth/challenge (challenge), /api/auth/wallet (sign_in_wallet, record_sign_in,
+# make_cookie), /api/auth/logout (log_out_everywhere), /api/me (email_from_cookie), /api/chats (list_chats),
+# /api/chats/save and /api/chats/delete (save_chat, delete_chat), /api/terms (terms_on, agreed), the Terms gate before
+# building any transaction (agreed), and /internal/customers for the kivystats dashboard (reads customers.db read-only).
+# The "email" names below are historical: since wallet sign-in it holds the lower-case wallet address.
+# Files (all in the service's data folder): one encrypted chat file per account under chats/, the logout times file,
+# customers.db (sign-ins + signed Terms), the terms_on switch file, and two private keys (cookie signing, chat encryption)
+# created on first use. walrus/export_records.py reads customers.db to save each signed agreement to Walrus.
 import base64
 import hashlib
 import hmac
@@ -45,10 +54,12 @@ def _key():
     return p.read_bytes()
 
 
+# base64url decode that tolerates missing '=' padding (cookies, JWT parts).
 def _b64d(s):
     return base64.urlsafe_b64decode(s + '=' * (-len(s) % 4))
 
 
+# Google sign-in leftovers (unused since wallet sign-in): the client id, Google's public keys, verify_google.
 def _client_id():
     try:
         return json.load(open(HOME / 'zklogin.json')).get('google_client_id') or ''
@@ -96,6 +107,7 @@ def verify_google(jwt):
     return email
 
 
+# The sign-in cookie: base64(account) . expiry . HMAC-SHA256 with the server's private cookie key. Set by /api/auth/wallet.
 def make_cookie(email):
     body = base64.urlsafe_b64encode(email.encode()).decode().rstrip('=') + '.' + str(int(time.time()) + USER_TTL)
     sig = hmac.new(_key(), body.encode(), hashlib.sha256).hexdigest()
@@ -113,6 +125,7 @@ def _logout_at(email):
         return _logouts.get(email, 0)
 
 
+# /api/auth/logout: remember "now" for this account, so every cookie issued before it is refused by email_from_cookie.
 def log_out_everywhere(email):
     global _logouts
     _logout_at(email)
@@ -123,6 +136,8 @@ def log_out_everywhere(email):
         tmp.write_text(json.dumps(_logouts)); os.chmod(tmp, 0o600); tmp.replace(LOGOUTS)
 
 
+# The signed-in account for a request's Cookie header, or None (bad signature, expired, or issued before a logout).
+# Called by server.py on every /api/me, /api/chats*, /api/terms and logout request.
 def email_from_cookie(header):
     for part in (header or '').split(';'):
         k, _, v = part.strip().partition('=')
@@ -143,6 +158,7 @@ def email_from_cookie(header):
     return None
 
 
+# The account's chat file: named by a hash of the account, so file names never show the address.
 def _file(email):
     return CHATS / (hashlib.sha256(('kivy:' + email).encode()).hexdigest() + '.json')
 
@@ -178,6 +194,7 @@ def _open(f, blob):
     return AESGCM(_chat_key()).decrypt(blob[4:16], blob[16:], f.name.encode())
 
 
+# /api/chats: every saved chat of the signed-in account ([] when none or unreadable).
 def list_chats(email):
     try:
         f = _file(email)
@@ -192,6 +209,7 @@ def _write(email, chats):
     tmp.write_bytes(_seal(f, json.dumps(chats[:MAX_CHATS]).encode())); os.chmod(tmp, 0o600); tmp.replace(f)
 
 
+# Validate and cap one chat the page sent (id format, turn count and sizes) before it is stored.
 def _clean(chat):
     cid = str(chat.get('id') or '')
     if not ID_RE.match(cid):
@@ -224,6 +242,8 @@ def _room_for_new():
     return _ROOM['ok']
 
 
+# /api/chats/save: insert or replace one chat (newest first unless index is given). server.py first refuses chats that
+# look like they contain a seed phrase or private key.
 def save_chat(email, chat, index=None):
     c = _clean(chat)
     if not _file(email).exists() and not _room_for_new():
@@ -236,6 +256,7 @@ def save_chat(email, chat, index=None):
         _write(email, chats)
 
 
+# /api/chats/delete
 def delete_chat(email, cid):
     with _lock:
         _write(email, [x for x in list_chats(email) if x.get('id') != str(cid)])
@@ -254,10 +275,12 @@ TERMS_URL = 'https://kivy.kivelabs.xyz/terms'
 CUSTOMERS = DATA / 'customers.db'
 
 
+# True when the Terms step is switched on (a flag file in the data folder).
 def terms_on():
     return (DATA / 'terms_on').exists()
 
 
+# customers.db, created on first use: customers (one row per wallet that signed in) and agreements (each signed Terms).
 def _cdb():
     c = sqlite3.connect(CUSTOMERS, timeout=10)
     c.execute('CREATE TABLE IF NOT EXISTS customers (address TEXT PRIMARY KEY, first_seen REAL, last_seen REAL, sign_ins INTEGER)')
@@ -288,6 +311,8 @@ def agreed(address):
     return r[0] if r and r[0] else None
 
 
+# /api/auth/challenge: a one-time message for the wallet to sign (valid 10 minutes, kept in memory only, so a
+# kivy-site restart cancels open sign-ins). It includes the Terms when they are switched on.
 def challenge(address):
     address = str(address or '').lower()
     if not ADDR.match(address):
@@ -313,6 +338,8 @@ def challenge(address):
     return msg
 
 
+# _uleb + _personal_digest: Sui's personal-message digest (intent bytes 3,0,0 + length + message, BLAKE2b-256),
+# the bytes a wallet actually signs.
 def _uleb(n):
     out = bytearray()
     while True:
@@ -355,6 +382,8 @@ def verify_personal(address, msg_bytes, sig_b64):
     return bool(((out.get('data') or {}).get('verifySignature') or {}).get('success'))
 
 
+# /api/auth/wallet: the nonce must be one challenge() issued for this address, unused and unexpired; then the signature
+# must verify. server.py then sets the cookie and (Terms on) calls record_sign_in.
 def sign_in_wallet(address, message, sig_b64):
     """Return the address when the one-time message was signed by it, else raise ValueError."""
     address = str(address or '').lower()

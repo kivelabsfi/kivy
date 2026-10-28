@@ -1,3 +1,10 @@
+/*
+ * chain.ts — the Sui chain connection for the transaction builder (imported by builder.ts and the simulate_dust / simulate_perp probes).
+ * In operation: builder.ts imports `grpc` (a SuiGrpcClient) and uses it for every read, build and simulation; `stats` is served
+ * as GET /chain-stats and `tatumOnly()` as GET /tatum-balances (health checks: tools/watchdog.py, tools/services_weekly.py).
+ * Input: gRPC calls from the Sui SDK. Output: the same answers, from Mysten's public fullnode or, failing that, Tatum.
+ * Links: @mysten/sui (SuiGrpcClient), @protobuf-ts grpc-web + grpc transports, @grpc/grpc-js (TLS channel to Tatum).
+ */
 // Kivy's Sui chain connection with a backup (2026-10-24: "use Tatum as our backup data").
 // Every gRPC call goes to Mysten's fullnode first; if Mysten can't answer (down, timeout, overloaded), the same call is sent
 // to Tatum's Sui gRPC and Mysten is skipped for 60 s. The answers are the same chain data, so builds, simulations and the
@@ -23,6 +30,7 @@ let mystenDownUntil = 0;
 
 const mysten = new GrpcWebFetchTransport({ baseUrl: MYSTEN });
 
+// the Tatum connection: native gRPC over IPv4 with the API key in a header; null when no key is installed
 let _tatum: { t: GrpcTransport; ip: string; at: number } | null = null;
 async function tatum(): Promise<GrpcTransport | null> {
   if (_tatum && Date.now() - _tatum.at < 10 * 60_000) return _tatum.t;      // re-resolve the IPv4 address every 10 minutes
@@ -45,9 +53,12 @@ let nextSlot = 0;
 const slot = () => { const now = Date.now(); const at = Math.max(now, nextSlot); nextSlot = at + 1000 / TATUM_RPS; return new Promise((r) => setTimeout(r, at - now)); };
 const limited = (e: any) => /429|RESOURCE_EXHAUSTED|Too Many/i.test(String(e?.code ?? '') + ' ' + String(e?.message ?? e));
 
+// only a transport-level failure moves a call to Tatum; a real chain answer (e.g. object not found) is passed through
 const shouldFailover = (e: any) => !(e instanceof RpcError) || FAILOVER.has(String(e.code));
 const quiet = (p: Promise<any>) => { p.catch(() => {}); return p; };
 
+// A protobuf-ts transport that the Sui SDK calls for every gRPC method: unary calls (all Kivy uses) go to Mysten, or to Tatum
+// when Mysten fails or is in its 60 s skip window; streaming calls stay on Mysten. stats counts each outcome (/chain-stats).
 class FailoverTransport implements RpcTransport {
   mergeOptions(o?: Partial<RpcOptions>): RpcOptions { return mysten.mergeOptions(o); }
   unary<I extends object, O extends object>(method: MethodInfo<I, O>, input: I, options: RpcOptions): UnaryCall<I, O> {
@@ -89,7 +100,7 @@ class FailoverTransport implements RpcTransport {
 // the client every part of kivy-lend uses
 export const grpc = new SuiGrpcClient({ network: 'mainnet', transport: new FailoverTransport() });
 
-// Tatum alone, for the health checks (kivy_watch, the Monday services report)
+// Tatum alone, for the health checks (watchdog, the Monday services report)
 export async function tatumOnly(): Promise<SuiGrpcClient> {
   const t = await tatum();
   if (!t) throw new Error('no Tatum key');

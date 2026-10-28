@@ -5,13 +5,19 @@
 Every hour (cron): read Aftermath's market list, then let the CHAIN decide what is real —
   - a market is trusted only if its object on Sui is a shared ClearingHouse<USDC> of Aftermath's perps program;
   - the program's official upgrades (same lineage, proven on chain) are followed and added to Kivy's allowlist.
-The result is lend/perps_markets.json, which the transaction builder checks every perps order against. New markets and
+The result is builder/perps_markets.json, which the transaction builder checks every perps order against. New markets and
 upgrades are NOT trusted automatically any more (review L3, 2026-10-28): a new program version goes to
 tools/perps_pending_pkgs.json and a ⚠️ alert asks for a check; only --approve adds it to both lists. New markets of the
 trusted program are still added automatically (Telegram FYI); anything the chain does not confirm is refused and alerted.
-  python3 tools/perps_markets_sync.py           # update + tell the owner what changed
-  python3 tools/perps_markets_sync.py --dry     # print, change nothing
-  python3 tools/perps_markets_sync.py --approve # trust the pending program version(s) (after kivy-vet-package)"""
+  python3 tools/sync_perps_markets.py           # update + tell the owner what changed
+  python3 tools/sync_perps_markets.py --dry     # print, change nothing
+  python3 tools/sync_perps_markets.py --approve # trust the pending program version(s) (after kivy-vet-package)"""
+# How it runs: crontab "17 * * * *" (every hour at :17), output appended to a log in the scratch folder; --dry is also
+# run by tools/perps_fix_draft.sh; --approve by hand only.
+# Reads: Aftermath's market list (AF) and Sui GraphQL (package versions, market objects).
+# Writes: builder/perps_markets.json (read by builder/builder.ts perpGuard before it builds any perps transaction),
+# tools/perps_pending_pkgs.json (upgrades waiting for approval), and with --approve the site's package allowlist
+# kivy_pkgs.json (read by the page's check 1 and by site/server.py). Messages go out through the shared alert sender.
 import json
 import os
 import subprocess
@@ -20,7 +26,7 @@ import time
 import urllib.request
 from pathlib import Path
 
-OUT = Path('/srv/kivy/lend/perps_markets.json')
+OUT = Path('/srv/kivy/builder/perps_markets.json')
 PKGS = Path('/opt/kivy/kivy_pkgs.json')
 GQL = 'https://graphql.mainnet.sui.io/graphql'
 AF = 'https://aftermath.finance/api/perpetuals/all-markets'
@@ -32,12 +38,14 @@ APPROVE = '--approve' in sys.argv
 PENDING = Path('/srv/kivy/tools/perps_pending_pkgs.json')
 
 
+# POST JSON, return the parsed JSON answer (Aftermath and GraphQL calls).
 def post(url, body, timeout=30):
     req = urllib.request.Request(url, data=json.dumps(body).encode(), headers={'Content-Type': 'application/json', 'User-Agent': 'kivy-perps-sync/1'})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.load(r)
 
 
+# One Sui GraphQL query; raises on GraphQL errors so a bad read never writes a list.
 def gql(query):
     j = post(GQL, {'query': query})
     if j.get('errors'):
@@ -45,6 +53,7 @@ def gql(query):
     return j['data']
 
 
+# Send one alert message (only printed with --dry).
 def tell(text):
     if DRY:
         print('[would send] ' + text)
@@ -53,10 +62,13 @@ def tell(text):
     subprocess.run(['/usr/bin/python3', SENDER, text], check=False, timeout=60)
 
 
+# A 0x id padded to 64 hex digits, so the same id always compares equal.
 def norm(a):
     return '0x%064x' % int(a, 16)
 
 
+# Program versions from the chain -> markets from Aftermath, each confirmed on chain -> diff with the old list ->
+# write the files -> alert about new versions, list changes and unconfirmed markets.
 def main():
     old = json.loads(OUT.read_text()) if OUT.exists() else {'markets': {}, 'packages': [ORIGINAL]}
     # 1. the program and its official upgrades: every version after the original, as the chain lists them
@@ -95,7 +107,7 @@ def main():
         new_p = [p for p in new_p if p not in pending]
     approved = [p for p in pending if p in trusted]
     packages = [p for p in packages if p in trusted]      # only trusted versions reach the builder and the allowlist
-    doc = {'_about': 'Written by tools/perps_markets_sync.py: Aftermath perps markets and program versions, each confirmed on chain. '
+    doc = {'_about': 'Written by tools/sync_perps_markets.py: Aftermath perps markets and program versions, each confirmed on chain. '
                      'The builder refuses any perps transaction outside this list.',
            'at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()), 'original': norm(ORIGINAL), 'packages': packages, 'markets': ok}
     print('confirmed %d markets, %d trusted program version(s); new %s; changed %s; gone %s; refused %s; program waiting for approval %s; approved now %s'
@@ -116,7 +128,7 @@ def main():
         if new_p and set(new_p) != set(pending):         # say it once per new version, not every hour
             tell('⚠️ Kivy · Aftermath upgraded its perps program — needs your OK\n\nNew version (official lineage, confirmed on chain): %s\n\n'
                  'Kivy does NOT trust it yet, so perps orders that use it are refused. After checking it (kivy-vet-package), run:\n'
-                 'python3 /srv/kivy/tools/perps_markets_sync.py --approve' % ', '.join(x[:10] + '…' for x in new_p))
+                 'python3 /srv/kivy/tools/sync_perps_markets.py --approve' % ', '.join(x[:10] + '…' for x in new_p))
         if new_m or changed or gone or (APPROVE and approved):
             tell('🟢 Kivy · Perps list updated automatically\n\n' +
                  ('New markets (confirmed on chain): %s\n' % ', '.join(new_m) if new_m else '') +
