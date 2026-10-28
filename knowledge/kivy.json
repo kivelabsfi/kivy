@@ -1,0 +1,301 @@
+{
+ "_about": "Everything Kivy knows and says. The site builds every reply from THIS file plus public market prices, and nothing else — no other project, person or system on this server is visible to it (the owner, 2026-09-30).",
+ "name": "Kivy",
+ "mode": "wallet-signs",
+ "greeting_title": "What can I help with?",
+ "greeting_text": "Tell me a money task in plain words. I'll lay out every step, the cost and the risks. When it's a swap or a transfer, your wallet asks you to approve it — nothing moves without your yes.",
+ "suggestions": [
+  "What can Kivy do?",
+  "What assets can Kivy play with?",
+  "Wallet balance"
+ ],
+ "status_chip": "Every transaction needs your approval",
+ "assets": [
+  "SUI",
+  "USDC",
+  "DEEP",
+  "WAL",
+  "BTC",
+  "ETH",
+  "SOL"
+ ],
+ "cap_usd": 0,
+ "slippage_cap_pct": 0.5,
+ "gas_sui": 0.001,
+ "venues": {
+  "swap": "Aftermath router (backups: Cetus aggregator, then Bluefin 7k)",
+  "lend": "Suilend or NAVI",
+  "withdraw": "Suilend or NAVI"
+ },
+ "rules": [
+  "I plan first: every step, the venue, the cost and the risks, before anything happens",
+  "Every transaction needs your explicit yes in your wallet. A plan of several steps is ONE transaction — one approval, and if any step fails nothing happens (that includes splitting one coin into up to 4 coins, each lent or kept, e.g. \"withdraw haSUI from NAVI, then 25% each into USDC, USDsui, SUI and DEEP, deposit into Suilend\"); a plan across several of your accounts is approved one account at a time, in order",
+  "Your wallet signs — I never hold your keys, and connecting only lets me read your address and balances",
+  "There is no $ limit on swaps, sends, lending or perps — you approve every transaction in your own wallet",
+  "Only these coins: {assets} — plus the coins Suilend and NAVI list (USDsui, vSUI, haSUI, sSUI, LBTC, wBTC, BLUE, NAVX…); anything unlisted is refused",
+  "Lending is supply only — never borrowing",
+  "A swap is refused if slippage would pass {slippage}%",
+  "Sending to another address shows the full address first; you approve that one transfer in your wallet"
+ ],
+ "help": "I can help with these:\n• swap: swap 5 SUI to USDC · swap all BTC to USDC\n• dust: swap all my dust to USDC — every coin under $0.01 in one approval, with what you get vs. the fees · sweep my dust then lend it on NAVI\n• rewards: claim my rewards — every market in one approval, with the rewards vs. the gas · claim my suilend rewards\n• send: send 1 USDC to name.sui (free for USDC) · send 1 SUI and 5 USDC to name.sui · send 1 USDC each to alice.sui and bob.sui · send all my USDC to my other wallet\n• lend: lend 10 USDC on NAVI · lend 1 SUI · withdraw all USDC from Suilend · change my vSUI to haSUI in NAVI\n• several steps, one approval: withdraw from aftermath then lend it on Suilend Ember (plus 5 USDC from my wallet) · take 1 USDC, swap half to SUI and half to DEEP, lend the SUI on NAVI and the DEEP on Suilend\n• perps: open BTC · open korean market · long SUI $10 5x · positions · deposit to perps\n• prices and balance: BTC price · price of BTC and ETH · how much USDC for 1 SUI · my total balance\n\nYour wallet signs every step — nothing moves without your yes.",
+ "no_wallet": "No wallet connected yet. Press “Connect wallet” at the top. I can read your address and balances; to swap or send, your wallet will ask you to approve each transaction — I never hold your keys.",
+ "plan_intro": "Here's the plan. Nothing happens until you approve it — your own wallet asks you, one step at a time.",
+ "plan_status": "Not executed yet — your wallet signs it only if you approve",
+ "price_intro": "Live prices (Bluefin mark, refreshed every minute):",
+ "faq": [
+  {
+   "keys": [
+    "hi",
+    "hello",
+    "hey",
+    "good morning",
+    "good evening",
+    "sawasdee"
+   ],
+   "answer": "Hi! I'm Kivy. Tell me a money task — like \"swap 5 SUI to DEEP\" or \"lend 10 USDC\" — and I'll show you the full plan first."
+  },
+  {
+   "keys": [
+    "who are you",
+    "what are you",
+    "your name",
+    "what is kivy",
+    "what's kivy"
+   ],
+   "answer": "I'm Kivy, a finance agent. You tell me what you want to do with your money in plain words; I lay out every step, the cost and the risks, and I only act when you say yes. Your own wallet signs every transaction — I never hold your keys."
+  },
+  {
+   "keys": [
+    "what can you do",
+    "help",
+    "how do i use",
+    "how does this work",
+    "commands"
+   ],
+   "answer": "@help"
+  },
+  {
+   "keys": [
+    "slippage"
+   ],
+   "answer": "Slippage is the gap between the price you're quoted and the price you actually get when the swap lands — the market can move in between, or your order can be big for the pool. I cap it at 0.5%: if a swap would slip more, I refuse it instead of filling at a bad price."
+  },
+  {
+   "keys": [
+    "gas",
+    "fee",
+    "fees",
+    "transaction cost"
+   ],
+   "answer": "Every transaction on Sui pays a small network fee in SUI, called gas — usually about 0.001 SUI (a fraction of a cent), and USDC transfers are free. Swaps also pay the pool's own trading fee, which is already inside the quote I show you.{kivy_fee}"
+  },
+  {
+   "keys": [
+    "suilend",
+    "lending",
+    "lend",
+    "interest",
+    "apr",
+    "apy"
+   ],
+   "answer": "Suilend and NAVI are lending markets on Sui. You deposit a coin (USDC, SUI, BTC…), borrowers pay interest, and you earn a yearly rate. Kivy only ever supplies — it never borrows — so what you lend can't be liquidated. You can usually withdraw any time — unless that coin is fully borrowed out for a while, or (on Suilend) that coin's on-chain price is stale — Kivy keeps each coin in its own Suilend account so only that coin's price matters, and retries for you for about a minute. If you don't hold the coin, Kivy swaps into it and lends in one approval. Say \"lending market\" to compare their rates."
+  },
+  {
+   "keys": [
+    "aftermath",
+    "router",
+    "swap route",
+    "best price"
+   ],
+   "answer": "Aftermath's router looks across Sui's trading pools and splits a swap to get the best price it can find — I try it first. If its route fails, I build the same swap with the Cetus aggregator, then Bluefin 7k: same coins, same amount, same price protection, still one approval. I show you the quoted amount before anything happens."
+  },
+  {
+   "keys": [
+    "safe",
+    "risk",
+    "risky",
+    "scam",
+    "trust",
+    "keys",
+    "private key",
+    "seed"
+   ],
+   "answer": "Two things keep you safe with me: nothing moves without your explicit yes in your own wallet (every transaction, any size), and I only work with a short list of coins and venues. Never share your seed phrase or private key with anyone — including me. I will never ask for it. And every transaction is checked twice: before your wallet opens, I simulate it and refuse if it would do anything you didn't approve; after it lands, I check the real result on chain against what I showed you."
+  },
+  {
+   "keys": [
+    "which coins",
+    "what coins",
+    "supported",
+    "tokens"
+   ],
+   "answer": "@assets"
+  },
+  {
+   "keys": [
+    "delta neutral",
+    "delta-neutral",
+    "hedge",
+    "funding"
+   ],
+   "answer": "A delta-neutral position holds a coin and an equal and opposite bet on it at the same time, so the price moving up or down cancels out and what's left is the income (like funding payments). It's a real strategy, but it needs two venues and careful sizing — not something I do yet."
+  },
+  {
+   "keys": [
+    "remember me",
+    "do you remember",
+    "memory",
+    "what do you know about me",
+    "my data",
+    "privacy"
+   ],
+   "answer": "I remember only what is public for your wallet: what you did through Kivy (read from the chain) and what you have lent right now — I rebuild it each time and don't store it. Your chats are saved only when you sign in with your wallet, and only you can open them. A sign-in lasts 7 days; Disconnect all in the wallet menu signs you out on every device. I never hold your keys."
+  },
+  {
+   "keys": [
+    "what is staked sui",
+    "what's staked sui",
+    "what is liquid staking",
+    "which staked sui",
+    "difference between ssui vsui hasui"
+   ],
+   "answer": "Staked SUI is SUI that earns the network's staking reward inside its price, so it is worth a little more SUI over time. Kivy can lend three kinds: sSUI (Suilend), vSUI and haSUI (both NAVI). Lending one earns a rate on top of the staking reward. Say \"swap my sui to the best staked sui and lend it\" and I'll pick the one paying most right now."
+  },
+  {
+   "keys": [
+    "what is dust",
+    "what's dust",
+    "dust coins",
+    "hidden coins",
+    "tiny balances"
+   ],
+   "answer": "Dust is a coin worth less than $0.01 — your wallet panel hides it. Say \"swap all my dust to USDC\" (or just \"sweep my dust\" — it goes into SUI, and the card lets you pick USDC or USDsui instead) and I'll swap every verified dust coin into that one coin in a single transaction, and show what you get against the gas and Kivy's fee first. Removing many small coins often gets you back more storage refund than the gas costs. It can also start a chain: \"sweep my dust into USDC, then lend it on Suilend\" — one approval. Coins Kivy doesn't recognise are never touched."
+  },
+  {
+   "keys": [
+    "one transaction",
+    "how many steps",
+    "too many steps",
+    "in one go",
+    "limits of a plan"
+   ],
+   "answer": "One transaction takes one starting coin (your wallet, a withdrawal — the same coin from several markets, plus a top-up of it from your wallet — your perps margin, or your dust), up to 2 swaps, and up to 4 final steps: lend, send, keep or deposit to perps. A split can turn one coin into up to 4 coins, each lent on its own market or kept. If what you ask doesn't fit, I say which part and you can do it in two requests — I never build half of it."
+  }
+ ],
+ "coins": {
+  "SUI": {
+   "type": "0x2::sui::SUI",
+   "decimals": 9
+  },
+  "USDC": {
+   "type": "0xdba34672e30cb065b1f93e3ab55318768fd6fef66c15942c9f7cb846e2f900e7::usdc::USDC",
+   "decimals": 6
+  },
+  "DEEP": {
+   "type": "0xdeeb7a4662eec9f2f3def03fb937a663dddaa2e215b8078a284d026b7946c270::deep::DEEP",
+   "decimals": 6
+  },
+  "WAL": {
+   "type": "0x356a26eb9e012a68958082340d4c4116e7f55615cf27affcff209cf0ae544f59::wal::WAL",
+   "decimals": 9
+  },
+  "BTC": {
+   "type": "0x876a4b7bce8aeaef60464c11f4026903e9afacab79b9b142686158aa86560b50::xbtc::XBTC",
+   "decimals": 8,
+   "note": "xBTC (OKX) — deepest BTC on Sui (2026-10-15)"
+  },
+  "ETH": {
+   "type": "0xd0e89b2af5e4910726fbcd8b8dd37bb79b29e5f83f7491bca830e94f7f226d29::eth::ETH",
+   "decimals": 8,
+   "note": "Sui Bridge ETH — deepest ETH on Sui"
+  },
+  "SOL": {
+   "type": "0xb7844e289a8410e50fb3ca48d69eb9cf29e27d223ef90353fe1bd8e27ff8f3f8::coin::COIN",
+   "decimals": 8,
+   "note": "Wormhole SOL — only liquid SOL on Sui; thin above ~$1k"
+  }
+ },
+ "rpc": "https://sui-rpc.publicnode.com",
+ "wallet_intro": "Your wallet (read-only):",
+ "network": "mainnet",
+ "graphql": {
+  "testnet": "https://graphql.testnet.sui.io/graphql",
+  "mainnet": "https://graphql.mainnet.sui.io/graphql"
+ },
+ "coins_testnet": {
+  "SUI": {
+   "type": "0x2::sui::SUI",
+   "decimals": 9
+  },
+  "USDC": {
+   "type": "0xa1ec7fc00a6f40db9693ad1415d0c193ad3906494428cf252621037bd7117e29::usdc::USDC",
+   "decimals": 6
+  },
+  "DEEP": {
+   "type": "0x36dbef866a1d62bf7328989a10fb2f07d769f4ee587c0de4a0a256e57e0a58a8::deep::DEEP",
+   "decimals": 6
+  },
+  "WAL": {
+   "type": "0x8270feb7375eee355e64fdb69c50abb6b5f9393a722883c1cf45f8e26048810a::wal::WAL",
+   "decimals": 9
+  }
+ },
+ "revenue": {
+  "_about": "Kivy's revenue (2026-10-22): a flat flat_fee_sui (0.0025 SUI since 2026-10-22; was 0.02, 0.01, then 0.005) added to EVERY transaction Kivy builds, paid to `address` (a new Kivy treasury wallet — address only, never a key), except a plain USDC send (it stays gasless). The old % fees are replaced (0). aftermath_ref_code: the owner's Aftermath referral code — users link to it with one free signature when they use perps. Built OFF: set address + enabled: true; set aftermath_ref_code to turn referrals on.",
+  "enabled": true,
+  "address": "0x7dac9b5066fb905eb3304ced3fbe3387902dbc1f2b41ee44443c59c112cd7d9b",
+  "swap_fee_pct": 0,
+  "lend_fee_pct": 0,
+  "flat_fee_sui": 0.0025,
+  "aftermath_ref_code": "6767"
+ },
+ "_cap_about": "cap_usd 0 = no $ limit on swaps, sends or lending (2026-10-23: 'no limit, depend on user ... it all user approve'). Set a number to bring a per-order limit back.",
+ "slippage_tiers": {
+  "_about": "Swap slippage per kind of pair (2026-10-24: as low as possible). The pair takes the LOOSEST tier of its two coins; slippage_cap_pct stays the ceiling. A tighter limit fails more often when the price moves between quote and approval (only gas is lost; 'Try again' gets a fresh quote).",
+  "stable": {
+   "pct": 0.05,
+   "coins": [
+    "USDC",
+    "USDsui",
+    "USDT",
+    "AUSD",
+    "BUCK",
+    "FDUSD",
+    "USDY",
+    "suiUSDT",
+    "wUSDC"
+   ]
+  },
+  "sui_lst": {
+   "pct": 0.1,
+   "coins": [
+    "SUI",
+    "vSUI",
+    "haSUI",
+    "sSUI",
+    "afSUI",
+    "stSUI",
+    "SPRING_SUI"
+   ]
+  },
+  "major": {
+   "pct": 0.2,
+   "coins": [
+    "SUI",
+    "USDC",
+    "xBTC",
+    "BTC",
+    "WBTC",
+    "LBTC",
+    "ETH",
+    "WETH",
+    "SOL",
+    "USDsui"
+   ]
+  }
+ },
+ "route_blocklist": [
+  "Metastable"
+ ],
+ "_route_blocklist_about": "Swap-router protocols Kivy never routes through (Aftermath protocolBlacklist). Metastable is winding down (2026-10-25): never route through it or allowlist its packages. Applies to every router: Cetus and Bluefin 7k leave these out too (2026-10-26)."
+}

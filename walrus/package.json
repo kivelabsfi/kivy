@@ -1,0 +1,1 @@
+{ "name": "kivy-walrus", "private": true, "type": "module", "dependencies": { "@mysten-incubation/memwal": "0.1.9" } }

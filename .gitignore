@@ -1,0 +1,31 @@
+# never commit secrets, data or machine state
+.env
+*.env
+*.key
+*.token
+*.salt
+.chat_key
+.user_key
+.session_secret
+data/
+state/
+*.log
+*.lock
+*.jsonl
+*.bak*
+node_modules/
+__pycache__/
+.venv*/
+tests/ui/shots/
+app/index.min.html
+app/static/app/
+
+# the AI part stays private (2026-10-28)
+knowledge/KIVYSOUL.md
+knowledge/TOOLS.md
+
+# not for the public repo (judge review 2026-10-28): developer probes, a one-off script, generated data
+lend/probe/
+lend/pa.ts
+lend/perps_markets.json   # generated hourly by tools/perps_markets_sync.py
+app/words_en.txt   # a generic English word list (typo fixer); not needed to read the code

@@ -1,0 +1,23 @@
+{
+  "name": "kivy-lend",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Kivy's lending builder: builds unsigned Suilend / NAVI USDC transactions for the USER's wallet to sign. Never holds or reads any key.",
+  "dependencies": {
+    "@bluefin-exchange/bluefin7k-aggregator-sdk": "7.6.3",
+    "@cetusprotocol/aggregator-sdk": "1.7.3",
+    "@grpc/grpc-js": "1.14.6",
+    "@mysten/bcs": "^2.1.2",
+    "@mysten/sui": "^2.36.0",
+    "@naviprotocol/lending": "^2.0.12",
+    "@naviprotocol/vault": "^0.0.1",
+    "@protobuf-ts/grpc-transport": "2.11.1",
+    "@suilend/sdk": "^13.5.0",
+    "@suilend/sui-core": "^2.2.0",
+    "tsx": "^4.23.15"
+  },
+  "overrides": {
+    "zod": "4.6.7"
+  }
+}
