@@ -17,10 +17,9 @@ Live: **https://kivy.kivelabs.xyz** (Sui mainnet, testing phase) · Built by [Ki
 | Swap | `swap 5 SUI to USDC` | ✓ |
 | Send | `send 1 USDC to name.sui`, several coins at once | ✓ |
 | Lend / withdraw | `lend 10 USDC`, `withdraw all from suilend` | ✓ |
-| Multi-step plans | `withdraw sSUI from Suilend, swap to USDC, lend half on NAVI and send the rest to bob.sui` | ✓ one PTB |
-| One coin into several | `withdraw haSUI from NAVI, then 25% each into USDC, USDsui, SUI and DEEP, deposit into Suilend` | ✓ one PTB (2–4 coins, each lent or kept) |
+| Multi-step plans | `withdraw sSUI from Suilend, swap to USDC, lend half on NAVI and send the rest to bob.sui` | ✓ |
+| One coin into several | `withdraw haSUI from NAVI, then 25% each into USDC, USDsui, SUI and DEEP, deposit into Suilend` | ✓ |
 | Perps | `long US500 $20 5x`, close, TP/SL (up to 3 take-profits), margin, limit / stop / TWAP orders | ✓ |
-| Across your accounts | `move my USDC from my Slush account to my Vera account and lend it` | one approval per account, in order |
 | Read | balances, lending rates for every coin, positions, history, charts | — |
 
 - **67 coins**: Kivy's core coins plus every coin Suilend or NAVI lists. **61 perps markets** on Aftermath, each verified on chain every hour.
@@ -81,6 +80,7 @@ check 2 (compare with plan) ─► ✅ / ⚠️
 
 ## Fees
 
+- **Blockchain fees:** sending stablecoin on sui are free but any transaction rather than sending stablecoin needed blockchain fees.
 - **Simple transactions are free:** one swap, send, lend, withdraw or perps action. **Sends are always free**, even several coins
   to several people in one transaction.
 - **Multi-step transactions** (several actions in one approval) include a flat **0.0025 SUI** to Kivy's treasury,
