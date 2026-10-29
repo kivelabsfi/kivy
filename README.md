@@ -2,6 +2,8 @@
 
 **DeFAI: all your finance, in one chat.**
 
+![Kivy turns one sentence into a 4-step plan: take SUI, swap to USDC, lend half on NAVI, send the rest, with one approval](docs/kivy-chat.png)
+
 A chat assistant for money on Sui. Say what you want in plain English, like "swap 5 SUI to USDC", "lend my USDC where
 it earns most" or "long BTC $10 at 5x". Kivy builds the transaction, shows every step and its cost, checks it twice,
 and your own wallet signs it. Kivy never holds a key.
