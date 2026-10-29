@@ -111,23 +111,10 @@ program outside the allowlist (`app/kivy_pkgs.json`), or if it would publish or 
 
 Chain reads go through **Sui GraphQL** first, with JSON-RPC only as a fallback.
 
-## Run it
+## Try it
 
-```bash
-# builder
-# serves 127.0.0.1:8799
-cd builder && npm ci && npx tsx builder.ts serve
-
-# site
-# serves 127.0.0.1:8772
-python3 app/server.py
-```
-
-- **Configuration:** `knowledge/kivy.json` (network, RPC/GraphQL endpoints, caps, coins, `revenue` switch). Set
-  `KIVY_PUBLIC=0` to lock the chat behind a login.
-- **AI keys:** come from the service environment, never from the repo.
-- **Runtime data:** `app/data/` is created at runtime and is **not** in this repo. It holds the internal token, the
-  metrics salt and database, chats and check logs.
+Use Kivy live at **https://kivy.kivelabs.xyz**: connect a Sui wallet and type what you want to do. This
+repository is the code behind it, published to be read; the web page and the AI's prompt are not included.
 
 ## Security
 
