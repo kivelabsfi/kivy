@@ -80,7 +80,7 @@ check 2 (compare with plan) ─► ✅ / ⚠️
 
 ## Fees
 
-- **Blockchain fees:** sending stablecoin on sui are free but any transaction rather than sending stablecoin needed blockchain fees.
+- **Network fees:** sending USDC on Sui is gas-free; every other transaction pays a small Sui gas fee from your wallet.
 - **Simple transactions are free:** one swap, send, lend, withdraw or perps action. **Sends are always free**, even several coins
   to several people in one transaction.
 - **Multi-step transactions** (several actions in one approval) include a flat **0.0025 SUI** to Kivy's treasury,
