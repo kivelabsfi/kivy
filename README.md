@@ -88,13 +88,6 @@ check 2 (compare with plan) ─► ✅ / ⚠️
 - No percentage fees.
 - After a perps account opens, Kivy offers (once, optionally) to link its Aftermath referral code with one free signature.
 
-## Walrus and Tatum
-
-| What | Where |
-|---|---|
-| **Walrus = Kivy's security memory.** Every transaction's checks (plan, check 1, chain result, check 2) and the rule set (the program allowlist) are written to Walrus as records: verdict plus a hashed wallet only, so they are tamper-proof and anyone can check them without seeing who signed. Corrections are new records, never edits. | `walrus/` (`export_records.py` → `upload.mjs`, `recall.mjs`) |
-| **Tatum = backup chain and price source.** When Sui GraphQL fails, reads and transaction builds fail over to Tatum's Sui gRPC, and wallet values fall back to Tatum prices. Display only: prices never feed a safety check. | `builder/chain.ts`, `app/server.py` |
-
 ## The web page
 
 The page itself (chat, cards, wallet panel, trading terminal) is not in this repository: use it live at
@@ -112,6 +105,8 @@ program outside the allowlist (`app/kivy_pkgs.json`), or if it would publish or 
 | AI brain | `brain.py` (trimmed): the 10 tools the AI may request (read data or make a PLAN — none can sign or send), the tool-calling loop where Kivy's code runs every tool, and the leak filter. The prompt, model choices and keys are private. | called by the site |
 | What Kivy knows and says | `knowledge/kivy.json` (rules, coins, copy, FAQ, fee switch); the AI's own prompt and tool notes are private | read fresh on every call |
 | Metrics | `app/metrics.py`: SQLite, wallets stored as salted hashes, no addresses | inside the site |
+| Security records | `walrus/`: every transaction's checks and the program allowlist saved to Walrus (hashed wallets, corrections as new records) | cron, every minute |
+| Backup chain and prices | `builder/chain.ts`: Tatum's Sui gRPC when Sui fails; Tatum prices for wallet values (display only) | inside the builder and site |
 | Tools | `tools/sync_perps_markets.py` (perps markets verified on chain, hourly) | cron |
 
 Chain reads go through **Sui GraphQL** first, with JSON-RPC only as a fallback.
