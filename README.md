@@ -30,11 +30,28 @@ Live: **https://kivy.kivelabs.xyz** (Sui mainnet, testing phase) · Built by [Ki
 ## How it stays safe
 
 ```
-message ─► reader (exact rules) ─unclear─► AI (tool calls only)
-              │                                  │
-              └──────────────► card ◄────────────┘
-                                │
-   build + simulate ─► check 1 (browser re-simulates) ─► user signs in own wallet ─► chain ─► check 2 (compare with plan) ─► ✅ / ⚠️
+message
+   │
+   ▼
+reader (exact rules)
+   │  unclear? ─► AI (tool calls only) ─┐
+   ▼                                    │
+card ◄──────────────────────────────────┘
+   │
+   ▼
+build + simulate
+   │
+   ▼
+check 1 (browser re-simulates)
+   │
+   ▼
+user signs in own wallet
+   │
+   ▼
+chain
+   │
+   ▼
+check 2 (compare with plan) ─► ✅ / ⚠️
 ```
 
 1. **The AI never builds or sends anything.** It can only ask Kivy's code for an action. The code checks the rules,
@@ -103,10 +120,12 @@ Chain reads go through **Sui GraphQL** first, with JSON-RPC only as a fallback.
 
 ```bash
 # builder
-cd builder && npm ci && npx tsx builder.ts serve      # serves 127.0.0.1:8799
+# serves 127.0.0.1:8799
+cd builder && npm ci && npx tsx builder.ts serve
 
 # site
-python3 app/server.py                          # serves 127.0.0.1:8772
+# serves 127.0.0.1:8772
+python3 app/server.py
 ```
 
 - **Configuration:** `knowledge/kivy.json` (network, RPC/GraphQL endpoints, caps, coins, `revenue` switch). Set
