@@ -1,6 +1,6 @@
 """Kivy's AI layer — PUBLIC, TRIMMED copy of brain.py.
 
-Tool CALLING, never tool RUNNING. The model reads the chat and may REQUEST one of the 10 tools below. Kivy's own code
+Tool CALLING, never tool RUNNING. The model reads the chat and may REQUEST one of the 14 tools below. Kivy's own code
 (passed in as `tools`) decides whether and how to run it, under the same rules as every other request. Every tool only
 reads data or produces a PLAN; none can sign, send or execute anything: a plan becomes a card, the user approves it,
 check 1 (app/guard.js) re-simulates it before the wallet opens, and check 2 (app/server.py) compares the landed
@@ -60,6 +60,16 @@ TOOLS = [{'functionDeclarations': [
                     'required': ['amount', 'asset']}},
     {'name': 'get_lending', 'description': 'Live lending rates on Suilend and NAVI for ANY coin (USDC, USDsui, SUI, sSUI, vSUI, BTC, WAL…), the collateral each market accepts (its risk), and every coin the user has lent and where. Pass asset to get that coin\'s markets; leave it empty for USDC.',
      'parameters': {'type': 'OBJECT', 'properties': {'asset': {'type': 'STRING', 'description': 'The coin, e.g. USDsui, SUI, sSUI. Empty = USDC.'}}}},
+    {'name': 'get_quote', 'description': "The swap router's live quote (nothing is built or signed): what an amount of one coin gets in another. Use for any 'how much X would I get', 'what is N worth in Y' question.",
+     'parameters': {'type': 'OBJECT', 'properties': {'from_asset': {'type': 'STRING'}, 'to_asset': {'type': 'STRING'},
+                    'amount': {'type': 'STRING', 'description': 'coins of from_asset, a plain number'}, 'usd': {'type': 'STRING', 'description': 'or a dollar amount of from_asset'}},
+                    'required': ['from_asset', 'to_asset']}},
+    {'name': 'get_fees', 'description': "Kivy's own fee and the Sui network fee, exactly — call it for ANY question about fees, charges, gas, subscriptions or cost.",
+     'parameters': {'type': 'OBJECT', 'properties': {}}},
+    {'name': 'get_activity', 'description': "The wallet's latest transactions from the chain (newest last): time, success, what moved, and for a failed one the chain's reason in plain words.",
+     'parameters': {'type': 'OBJECT', 'properties': {}}},
+    {'name': 'get_holding_value', 'description': 'What one coin the user holds is worth now: in the wallet and lent in each market, at the live price.',
+     'parameters': {'type': 'OBJECT', 'properties': {'asset': {'type': 'STRING', 'description': 'The coin, e.g. sSUI, USDsui, SUI'}}, 'required': ['asset']}},
 ]}]
 
 

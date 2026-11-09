@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # export_records.py — step 1 of the Walrus saver: turns Kivy's security records into plain text for Walrus Memory.
-# Run by sync_records.sh (cron); prints a JSON list of {key, digest, ns, text} on stdout, which upload.mjs reads.
+# Run by sync_records.sh (kivy-walrus.timer, as user kivy); prints a JSON list of {key, digest, ns, text} on stdout, which upload.mjs reads.
 # Reads (read-only): Kivy's metrics database (pipeline table), the after-signing checks log, the Terms agreements database,
 # kivy_pkgs.json (the allowlist) and ledger.jsonl (what upload.mjs already saved). Writes nothing itself (senders.py may add to its senders.json cache).
 # Links: metrics.py (metrics.wh = Kivy's salted wallet hash), senders.py (wallet hash for old records, from Sui GraphQL).
@@ -11,7 +11,7 @@ check with no pipeline row (data/checks.jsonl, older ones), and one for the rule
 Each wallet has its own space on Walrus (namespace wallet-<hash>, hash = Kivy's salted metrics.wh); the rule set is in
 kivy-rules. No raw address leaves the box; old records without a wallet get it from the chain (senders.py). Records already saved
 (ledger.jsonl) are skipped, so this is safe to run again. A transaction waits for its check 2 (at most 2 hours).
-Runs on its own: cron every minute (sync_records.sh; nothing is sent when nothing is new), so a new transaction is on Walrus ~1 minute after check 2.
+Runs on its own: kivy-walrus.timer every minute, as user kivy (sync_records.sh; nothing is sent when nothing is new), so a new transaction is on Walrus ~1 minute after check 2.
   python3 export_records.py            # print the new records as JSON (upload.mjs reads this)
 """
 import datetime as dt
@@ -60,6 +60,9 @@ def _verdict(c):
     return 'FAILED: ' + '; '.join(c.get('problems') or [c.get('why') or 'no reason recorded']) + notes
 
 
+DROPPED = Path(__file__).resolve().parent / 'run.log'    # records left out for carrying a raw address (review W2-3); run.log is the one log the sandboxed service may write
+
+
 def who(w):
     """'you' and 'Kivy' stay; any other wallet (shown shortened in the logs) becomes 'another wallet'."""
     return w if w in ('you', 'Kivy') else 'another wallet'
@@ -97,7 +100,7 @@ def pipeline_records(done, chain_lookup=True):
                 'Check 2 (after signing, against the plan): %s.'
                 % (when(ts), kind or '?', wh or 'none', '; '.join(scrub(x) for x in (plan or {}).get('steps') or []) or 'not recorded',
                    (plan or {}).get('fee_sui', 0), moves(sim), verdict(c1), s.get('result') or 'not recorded',
-                   (' (%s, %.1f s)' % (s.get('wallet'), (s.get('ms') or 0) / 1000)) if s.get('wallet') else '',
+                   (' (%s, %.1f s)' % (scrub(str(s.get('wallet'))), (s.get('ms') or 0) / 1000)) if s.get('wallet') else '',
                    digest or 'none', (chain or {}).get('status') or 'not recorded', moves((chain or {}).get('moves')), verdict(c2)))
         out.append({'key': key, 'digest': digest, 'ns': space(wh), 'text': text})
     return out, {r[8] for r in rows if r[8]}
@@ -179,7 +182,7 @@ def rules_record(done):
     names = d.get('names') or {}
     pk = ', '.join('%s (%s)' % (p, names.get(p, '?')) for p in d.get('packages') or [])
     text = ('Kivy security rule set, version sha256 %s, saved %s. Kivy refuses to sign any transaction that calls a Move '
-            'package not on this list, except a DEX router adapter inside a swap, which is allowed and reported. '
+            'package not on this list (a DEX step inside a swap route too: refused until vetted and listed). '
             'Allowed packages (%d): %s.' % (h, dt.datetime.now(dt.timezone.utc).strftime('%Y-%m-%d'), len(d.get('packages') or []), pk))
     return [{'key': 'rules:' + h, 'digest': None, 'ns': 'kivy-rules', 'text': text}]
 
@@ -189,9 +192,20 @@ def main():
     done = {json.loads(x)['key'] for x in LEDGER.read_text().splitlines() if x.strip()} if LEDGER.exists() else set()
     tx, seen = pipeline_records(done)
     recs = rules_record(done) + terms_records(done) + tx + check_records(done, seen) + recheck_records(done)
-    for r in recs:                                     # belt and braces: no wallet address in a transaction record
-        assert r['key'].startswith(('rules:', 'terms:')) or not re.search(r'0x[0-9a-fA-F]{4}', r['text']), 'raw address in ' + r['key']
-    print(json.dumps(recs, ensure_ascii=False))
+    # belt and braces: no wallet address in a transaction record. A bad record is dropped and named once in run.log,
+    # never the whole batch: one visitor-set string used to stop every upload (review W2-3, 2026-11-02). Not stderr: the
+    # sync script reads stdout+stderr as the JSON list.
+    bad = [r for r in recs if not r['key'].startswith(('rules:', 'terms:')) and re.search(r'0x[0-9a-fA-F]{4}', r['text'])]
+    if bad:
+        try:                                           # the note is best effort: it must never stop the good records
+            old = DROPPED.read_text() if DROPPED.exists() else ''
+            with DROPPED.open('a') as f:
+                for r in bad:
+                    if r['key'] not in old:
+                        f.write('%s dropped (raw address): %s\n' % (time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()), r['key']))
+        except OSError:
+            pass
+    print(json.dumps([r for r in recs if r not in bad], ensure_ascii=False))
 
 
 if __name__ == '__main__':

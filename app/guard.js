@@ -12,28 +12,33 @@
 function normAddr(a) { try { return '0x' + BigInt(a).toString(16).padStart(64, '0'); } catch (e) { return String(a).toLowerCase(); } }
 function normType(t) { var p = String(t).split('::'); p[0] = normAddr(p[0]); return p.join('::'); }
 function ownerAddr(o) { return o && (o.AddressOwner || (o.ConsensusAddressOwner && o.ConsensusAddressOwner.owner)) || null; }
+function ownerShared(o) { return !!(o && (o.Shared || o.Immutable || o.$kind === 'Shared' || o.$kind === 'Immutable')); }   // shared or frozen: out of the owner's sole control
 // Audit V01: the Move packages a Kivy transaction may call — Suilend, NAVI, Aftermath perps, the framework and the swap
-// routes seen so far (same list as /opt/kivy/kivy_pkgs.json). A lending/perps/other call to any other package is refused;
-// an unlisted DEX adapter inside a swap route is allowed but reported (the money rules below still bound it).
+// routes seen so far (same list as /opt/kivy/kivy_pkgs.json). A call to any other package is refused, whatever its module is
+// called — a swap-route adapter too (review H1, 2026-10-29: a module NAMED 'router' could drain lent coins); it is also
+// reported so it can be vetted and listed (kivy-vet-package).
 // Aftermath's swap-route fee wallet: its share can come in a middle coin of the route (afSUI…), which the plan doesn't list
-var KIVY_PKGS = (function () {                      // the allowlist: the server puts kivy_pkgs.json in #kivy-pkgs (one list); this copy is the fallback
+var KIVY_PKGS = (function () {                      // the allowlist: the server puts kivy_pkgs.json in #kivy-pkgs (one list)
   var el = document.getElementById('kivy-pkgs'); try { if (el) return JSON.parse(el.textContent); } catch (e) {}
-  return ["0x1", "0x2", "0x59672975e15c58ffc9450f5236b6aa9fa2407d94b8081e634778aa01957d8c6f", "0x13e1e0ddcf3a76cde006d530e98a0f985c446013cfedeae6dd067a2f1ea88ff5", "0x4837ae94425107554c8847721cf9954c1ad8e10520433b9e37dc11c507148bea", "0x512f28261c1a293f49416d8885b8d5d32bde6dd68a99a0be36fe42b248e6833a", "0x3ec740df8428aa9c93aaef7f8cc1542ac3194fd014826b51bfe245346d64efc7", "0x145d86a4d4c6d2ea04fe858b60099faf3ea00ca4fd441263229780f0099fc552", "0xdd7a36e04666c3d816f4d3b97bc666e7188fb468fb0dfdfbbec3898d07707e7f", "0xe42ac8aae0abacc1cad43439927c3563f7d315386203a876d7f7006632d77f14", "0x011354dcf03830d91354a7895949188e60c88b2bb96ef66143880c3cace66fa3", "0x05bb8426f7a0d92382533ce392d87975770394403990f83c5a43157e282627e3", "0x7ca2b6a3241764817175cfa99c2cd3e973a2025071e7c83ec7338ce52a893413", "0x7de5de8d75a8f4e42cdd3c018f788bc9b9ebf2d3d61dcfe9d2136f17f077afd5", "0x8ad41a6d9374b18a2fd9cdedb2a0c4cd1da540848e17577fa0328ea8f1c96d24", "0x8cd0b2cbaf9d39f457f2d6a6fca0c96500a4d5654b99e1ba86d74a518c68017a", "0xb5e52ac983d8be934d5d1ca7cd51695c4e6a549e55943b166dd02d0b522e1d2d", "0xbee9cb333752646694dcf1fbdfcf232a7e110e4cce02047cf52a8c04de34c133", "0xeef5a96c8797c5bfbf1dbee1ce33782111d51aeb91a92fea4233513ab7ca7498", "0xf92e4e916418d5ae50437cd9fddc17f338429df64062feab1a512c506072f742", "0xfa1fbcb69a0018c620171e191beffa01c38bea9eefd8e55f5cf8708903f7cb29", "0x1443655ce6bb848c59a4114eec6efb5f46126462c92dbe4e610f9682a7d369ee", "0xfa9379a0d22b59732f2f7fac6e6ddc87afa54f8335277c33de9f04fdd4be7520"];
+  return [];                                      // no block: nothing is allowlisted, every call is refused (was a stale copy; a reviewer 2026-11-04 S2)
 })().map(normAddr);
-// swap routers' own fee wallets (Aftermath; Cetus and Bluefin 7k pay none for Kivy's routes): the ONLY addresses a coin the plan
+// swap routers' own fee wallets (Aftermath; Cetus pays none for Kivy's routes): the ONLY addresses a coin the plan
 // never mentions may go to during a swap (audit nv #1 — any address used to pass, so a route could drain lent positions)
 var ROUTER_FEE_WALLETS = ['0x1fb0c0a6790860fc83c8f26f6fa089868ad94de9468348f98dfb4cdf89a53777'];
-// the swap aggregators' entry programs (Aftermath router, Cetus aggregator v3, Bluefin 7k). 2026-10-28: a hop inside their
+// the swap aggregators' entry programs (Aftermath router, Cetus aggregator v3). 2026-10-28: a hop inside their
 // route is trusted wherever it goes — a coin only the route touches may go to any address (a pool's fee wallet); the user's own
 // coins keep the 1% limit and every "you must receive" check below
-var AGG_PKGS = ['0x7de5de8d75a8f4e42cdd3c018f788bc9b9ebf2d3d61dcfe9d2136f17f077afd5', '0xffd4058af7d6f6d66c335930cced8c91e38ec943e2392232aee27e8127e684e9', '0x62412b7268c35f3808336aee57a52836501f40b8ba5d936f8ad275e672befd04'].map(normAddr);
+var AGG_PKGS = ['0x7de5de8d75a8f4e42cdd3c018f788bc9b9ebf2d3d61dcfe9d2136f17f077afd5', '0xffd4058af7d6f6d66c335930cced8c91e38ec943e2392232aee27e8127e684e9'].map(normAddr);
+// Aftermath perps (allowlisted): only a perps plan may call it — the server marks its guard `perps`. An order slipped into a swap
+// moves no coin and no object, so no other rule here would see it (review K-4, 2026-10-30; the server's check 2 refuses it too)
+var PERPS_PKGS = ['0x3ec740df8428aa9c93aaef7f8cc1542ac3194fd014826b51bfe245346d64efc7'].map(normAddr);
 // json: the transaction as the wallet will get it; g: the server's guard (out / in / vol / pay / gas / fee);
 // addr: the signer. Resolves with the balance changes (for pipe), rejects with the reason the card shows.
 // Called by sign() in kivyAct1.
 function checkIntent(json, g, addr) {
   if (!g) return Promise.reject(new Error('Kivy could not check this transaction, so it was not sent.'));
-  var calls = [], reserve = {}, odd = false;
-  return Promise.all([import('/vendor/sui-2.36.0.js'), import('/vendor/sui-2.36.0.js')]).then(function (m) {
+  var calls = [], reserve = {}, odd = false, budget = null;
+  return import('/vendor/sui-2.36.0.js').then(function (s) { return [s, s]; }).then(function (m) {
     var client = new m[1].SuiGraphQLClient({url: gqlUrl(NET), network: NET});
     var tx = m[0].Transaction.from(json);
     // spending straight from the account balance (FundsWithdrawal): each reserved maximum is read here, not only the simulated
@@ -46,6 +51,8 @@ function checkIntent(json, g, addr) {
       if (rs.MaxAmountU64 == null || !ty) { odd = true; return; }
       var k = normType(String(ty)); reserve[k] = (reserve[k] || 0n) + BigInt(rs.MaxAmountU64);
     });
+    var gd = tx.getData().gasData || {};
+    if (gd.budget != null && gd.budget !== '') budget = BigInt(gd.budget);   // the transaction's own gas limit (L1)
     var cmds0 = tx.getData().commands || [];
     if (cmds0.some(function (c) { return c.Publish || c.Upgrade || c.$kind === 'Publish' || c.$kind === 'Upgrade'; }))   // audit nv #2
       throw new Error('Kivy stopped this transaction: it would publish or upgrade a program. Nothing was signed.');
@@ -63,27 +70,43 @@ function checkIntent(json, g, addr) {
     Object.keys(g.out || {}).forEach(function (k) { out[normType(k)] = BigInt(g.out[k]); });
     Object.keys(g.in || {}).forEach(function (k) { inn[normType(k)] = BigInt(g.in[k]); });
     Object.keys(g.vol || {}).forEach(function (k) { vol[normType(k)] = BigInt(g.vol[k]); });
-    out[SUI] = (out[SUI] || 0n) + BigInt(g.gas || 0);
+    // gas: never more than this transaction's own budget + 10% (it can't burn more), and never more than the server's cap —
+    // a flat 0.1 SUI let a route skim ~0.09 SUI unseen (review L1, 2026-10-29)
+    var gasOk = BigInt(g.gas || 0); if (budget != null && budget * 11n / 10n < gasOk) gasOk = budget * 11n / 10n;
+    out[SUI] = (out[SUI] || 0n) + gasOk;
+    // SUI promised to the user is counted before the network fee, which comes out of the same SUI — a small SUI withdrawal
+    // was refused as "short" by its own fee (review K-8 follow-up, 2026-10-30)
+    var gu = (t.effects || {}).gasUsed, suiNet = 0n, gasNet = gu ? BigInt(gu.computationCost || 0) + BigInt(gu.storageCost || 0) - BigInt(gu.storageRebate || 0) : gasOk;
+    if (gasNet < 0n) gasNet = 0n; if (gasNet > gasOk) gasNet = gasOk;
+    // Kivy's own fee comes out of the same SUI too; it is an approved payment (in g.pay, checked below), so it is added back —
+    // a dust sweep into SUI was refused for exactly its fee
+    var fa = g.fee || g.fee_added;                    // sign() adds the fee, then passes it here as fee_added
+    var feeBack = fa && pays.some(function (p) { return normAddr(p.address) === normAddr(fa.address) && normType(p.coin_type) === SUI; }) ? BigInt(fa.mist || 0) : 0n;
     // every approved payment, added up per recipient and coin: two sends to one address need both amounts (audit V01)
     pays.forEach(function (p) { var k = normAddr(p.address) + '|' + normType(p.coin_type); need[k] = (need[k] || 0n) + BigInt(p.amount); });
     Object.keys(reserve).forEach(function (ty) {
       if (reserve[ty] > (out[ty] || 0n)) bad.push('it could take up to ' + reserve[ty].toString() + ' units of ' + ty.split('::').pop() + ' from your account balance' + (out[ty] ? ' (approved ' + out[ty].toString() + ')' : ', which you did not approve'));
     });
-    if (odd) pipe(g, 'pkg_unlisted', {pkgs: ['FundsWithdrawal: unreadable reservation']});   // a new format: reported, the simulation still bounds it
+    if (odd) {                                       // a new format: reported, and refused (was reported only; a reviewer 2026-11-04 S3)
+      pipe(g, 'pkg_unlisted', {pkgs: ['FundsWithdrawal: unreadable reservation']});
+      bad.push('it takes from your account balance in a way Kivy cannot read');
+    }
     var swapping = calls.some(function (c) { return c.mod === 'router' && KIVY_PKGS.indexOf(c.pkg) >= 0; });   // Aftermath's own (allowlisted) router, not any module named 'router' (S-01)
     calls.forEach(function (c) {
       if (KIVY_PKGS.indexOf(c.pkg) >= 0) return;
-      if (swapping && c.mod === 'router') warn.push(c.pkg + '::' + c.mod);   // a new DEX in the swap route: reported, still bounded below
-      else bad.push('it calls a program Kivy has not verified (' + c.pkg.slice(0, 10) + '…::' + c.mod + ')');
+      warn.push(c.pkg + '::' + c.mod);                 // reported for vetting, and refused: no exemption for a module's NAME (review H1)
+      bad.push('it calls a program Kivy has not verified (' + c.pkg.slice(0, 10) + '…::' + c.mod + ')');
     });
+    if (!g.perps && calls.some(function (c) { return PERPS_PKGS.indexOf(c.pkg) >= 0; })) bad.push('it calls the perps program, which this plan does not use');
     // pure aggregator swap: an aggregator is called and nothing outside a router pulls value out of a protocol (no lending
     // withdraw / redeem / borrow / claim, no perps collateral withdraw) — else a route-only coin keeps the strict rule
     var FW = [normAddr('0x1'), normAddr('0x2')];
     var pureAggSwap = calls.some(function (c) { return AGG_PKGS.indexOf(c.pkg) >= 0; }) &&
-      !calls.some(function (c) { return c.mod !== 'router' && FW.indexOf(c.pkg) < 0 && /withdraw|redeem|borrow|claim|collateral|unstake|liquidat/i.test(c.fn); });
+      !calls.some(function (c) { return FW.indexOf(c.pkg) < 0 && /withdraw|redeem|borrow|claim|collateral|unstake|liquidat/i.test(c.fn); });   // any module (H1)
     (t.balanceChanges || []).forEach(function (c) {
       var who = normAddr(c.address), ty = normType(c.coinType), v = BigInt(c.amount);
       if (who === me) {
+        if (ty === SUI) suiNet += v;
         if (v >= 0n) { got[ty] = (got[ty] || 0n) + v; return; }
         var ct = g.ctokens && /::reserve::CToken<.+?,\s*(.+)>$/.exec(ty);
         if (ct) {                                   // a withdrawal hands back the user's own receipts — only of the planned coin, and
@@ -95,7 +118,7 @@ function checkIntent(json, g, addr) {
         if (-v > (out[ty] || 0n)) bad.push('it would take ' + (-v).toString() + ' units of ' + ty.split('::').pop() + (out[ty] ? ' (approved ' + out[ty].toString() + ')' : ', which you did not approve'));
       } else if (v > 0n) credit[who + '|' + ty] = (credit[who + '|' + ty] || 0n) + v;
     });
-    Object.keys(inn).forEach(function (ty) { if ((got[ty] || 0n) < inn[ty]) bad.push('you would not receive the ' + ty.split('::').pop() + ' this should pay you'); });
+    Object.keys(inn).forEach(function (ty) { if ((ty === SUI ? suiNet + gasNet + feeBack : (got[ty] || 0n)) < inn[ty]) bad.push('you would not receive the ' + ty.split('::').pop() + ' this should pay you'); });
     Object.keys(need).forEach(function (k) { if ((credit[k] || 0n) < need[k]) bad.push('the recipient would not get the ' + k.split('::').pop() + ' you approved'); });
     var payee = {}; pays.forEach(function (p) { payee[normAddr(p.address)] = 1; });
     Object.keys(credit).forEach(function (k) {     // anyone else (a swap route's fee wallet): at most 1% of the most of that coin the plan moves
@@ -117,6 +140,8 @@ function checkIntent(json, g, addr) {
       else if (was && normAddr(was) === me && !(now && normAddr(now) === me) && !/^0x0*2::coin::Coin</.test(ty)) bad.push('it would take one of your objects (' + (ty.split('::').slice(-2).join('::') || 'an object') + ') out of your wallet');
       // a NEW object for someone else must be a plain coin (a payment, checked above) — never a wrapper that could carry your funds
       else if (!was && now && normAddr(now) !== me && !/^0x0*2::coin::Coin</.test(ty)) bad.push('it would create something (' + (ty.split('::').slice(-2).join('::') || 'an object') + ') for another address');
+      // a coin of yours, or a new coin, made shared or frozen is out of your hands too — anyone may take a shared coin (review M1)
+      else if (ownerShared(o.outputOwner) && /^0x0*2::coin::Coin</.test(ty) && (was ? normAddr(was) === me : !o.inputOwner)) bad.push('it would put a coin where anyone can take it (shared)');
     });
     if (warn.length) pipe(g, 'pkg_unlisted', {pkgs: warn.slice(0, 5)});
     if (bad.length) throw new Error('Kivy stopped this transaction: ' + bad[0] + '. Nothing was signed.');

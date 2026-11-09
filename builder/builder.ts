@@ -41,8 +41,8 @@
  *        numbers (expected / minimum out, fees, gas) server.py turns into a card. Reads return plain data.
  *   links: chain.ts (Sui gRPC with failover) · merge.ts (joins two transaction kinds) · ../knowledge/kivy.json (coins, fees,
  *          slippage tiers, route blocklist) · kivy_pkgs.json (package allowlist) · perps_markets.json (verified perps
- *          markets, kept by tools/sync_perps_markets.py) · SDKs: Suilend, NAVI lending + vault, Cetus aggregator,
- *          Bluefin 7k · HTTP: Aftermath router / perpetuals / price-info, Suilend SpringSui APY, Sui GraphQL (coin metadata)
+ *          markets, kept by tools/sync_perps_markets.py) · SDKs: Suilend, NAVI lending + vault, Cetus aggregator
+ *          · HTTP: Aftermath router / perpetuals / price-info, Suilend SpringSui APY, Sui GraphQL (coin metadata)
  *
  * ── ONE REQUEST (example: swap then lend) ──────────────────────────────────────────────────────────────────────
  *
@@ -53,7 +53,7 @@
  *                                      │ HTTP server [S17] -> handle() [S16] -> routed() [S5]
  *                                      v
  *                      buildSwapLend() [S6]: routeQuote -> coinWithBalance -> routeTrade -> depositCoin
- *                                      │ Aftermath router, else Cetus, else Bluefin 7k; Suilend / NAVI SDKs
+ *                                      │ Aftermath router, else Cetus; Suilend / NAVI SDKs
  *                                      v
  *                      simulate() [S4]: dry run on Sui through chain.ts, set the gas budget
  *                                      │ fails -> {ok:false, error} (a route failure tries the next router first)
@@ -84,7 +84,7 @@
  *   [S2]   153-226   MARKET DATA: Suilend markets and NAVI vaults loaded through their SDKs (cached 60 s); rate() = one market's USDC yearly %
  *   [S3]   227-352   POSITIONS: what a wallet has lent: NAVI reads (15 s), Suilend accounts (one per coin), shared reads, position()
  *   [S4]   353-519   SIMULATE + PLAIN LEND / WITHDRAW: simulate() (dry run + gas budget), depositCoin() (into Suilend / NAVI / a vault), build() (GET /build)
- *   [S5]   520-737   SWAP ROUTERS: Aftermath router, then Cetus, then Bluefin 7k (routed / routeQuote / routeTrade), Kivy's swap + lend fees, allowlist
+ *   [S5]   520-737   SWAP ROUTERS: Aftermath router, then Cetus (routed / routeQuote / routeTrade), Kivy's swap + lend fees, allowlist
  *   [S6]   738-1064  MULTI-STEP BUILDS: swap-then-lend (/swaplend), withdraw-then-swap or move (/withdrawswap), any chain of steps (POST /compose)
  *   [S7]  1065-1163  DUST SWEEP: POST /dust: every coin worth under $0.01 swapped into one coin, one transaction
  *   [S8]  1164-1212  MULTI-SEND: POST /sendmany: several coins to several addresses, from the wallet or withdrawn from lending
@@ -102,7 +102,6 @@
 // [S1] SETUP
 // imports, the token / package constants, the lending markets Kivy supports, small unit helpers
 // ══════════════════════════════════════════════════════════════════════════════════════════════════════════════
-import { SuiGrpcClient } from '@mysten/sui/grpc';
 import { Transaction, coinWithBalance } from '@mysten/sui/transactions';
 import {
   SuilendClient, initializeSuilend, initializeObligations, initializeSuilendRewards, formatRewards,
@@ -114,7 +113,6 @@ import { mergeKinds } from './merge.ts';
 import { readFileSync, statSync } from 'node:fs';
 import { normalizeStructTag, normalizeSuiAddress } from '@mysten/sui/utils';
 import * as CET from '@cetusprotocol/aggregator-sdk';
-import * as SK from '@bluefin-exchange/bluefin7k-aggregator-sdk';
 // the Cetus SDK carries its own copy of the Sui library: its transactions are passed as bytes, never as objects
 import { Transaction as CetusTx } from './node_modules/@cetusprotocol/aggregator-sdk/node_modules/@mysten/sui/dist/transactions/index.mjs';
 
@@ -147,6 +145,21 @@ const out = (o: any) => { process.stdout.write(JSON.stringify(o) + '\n'); };
 // Mysten's fullnode first, Tatum's Sui gRPC when Mysten can't answer (chain.ts, 2026-10-24)
 import { grpc, stats as chainStats, tatumOnly } from './chain.ts';
 const toBase = (x: number) => BigInt(Math.round(x * 10 ** DEC));
+// an amount the user typed ('0.29', 0.29, '1e-7') -> exact base units, rounded DOWN, with decimal-string maths: never float
+// flooring (Math.floor(0.29 * 1e8) = 28,999,999 — a reviewer L4, 2026-10-29). Same rule as server.py base_units().
+function toUnits(amount: any, dec: number): bigint {
+  let t = String(amount ?? '').trim();
+  if (/e/i.test(t)) t = Number(t).toFixed(Math.min(100, dec + 2));
+  const m = /^(\d*)(?:\.(\d*))?$/.exec(t);
+  if (!m || !(m[1] || m[2])) throw new Error('Not an amount: ' + String(amount).slice(0, 20));
+  return BigInt((m[1] || '0') + (m[2] ?? '').padEnd(dec, '0').slice(0, dec));
+}
+// base units -> the exact decimal text ('29000000', 8 -> '0.29')
+function unitsText(u: bigint, dec: number): string {
+  if (!dec) return u.toString();
+  const t = u.toString().padStart(dec + 1, '0');
+  return (t.slice(0, -dec) + '.' + t.slice(-dec)).replace(/\.?0+$/, '');
+}
 const fromBase = (x: any) => Number(x) / 10 ** DEC;
 const ctokenType = (m: Market, t = USDC) => `${CTOKEN_ORIGIN}::reserve::CToken<${m.type}, ${t}>`;
 
@@ -201,6 +214,18 @@ function vaults() {
   }
   return _vaults.v;
 }
+// "withdraw 0.2 usdc, lend 0.1 here and 0.1 there": a withdrawal hands back a hair less (0.199979), so exact pieces that
+// add up to the whole would fail. A shortfall of 0.1% or less is rounding dust: the last exact piece gives it up.
+// Anything bigger is a real over-ask and still refused. (Claude's 3-4 step scenarios, 2026-11-07)
+function trimDust(sinks: any[], want: (k: any) => bigint | null, E: bigint) {
+  const fixed = sinks.filter((k) => want(k) != null);
+  const total = fixed.reduce((t, k) => t + (want(k) as bigint), 0n);
+  const short = total - E;
+  if (short <= 0n || !fixed.length || short * 1000n > total) return;
+  const last = fixed[fixed.length - 1], cut = (want(last) as bigint) - short;
+  if (cut > 0n) last.amount = { ...last.amount, raw: cut };
+}
+
 // a NAVI vault market's vault object (from NAVI's vault SDK list, refreshed every 60 s)
 async function vaultOf(m: Market) {
   const v = (await vaults()).find((x: any) => x.name === m.vaultName);
@@ -354,8 +379,22 @@ async function position(m: Market, addr: string, T = USDC, dec = DEC) {
 // [S4] SIMULATE + PLAIN LEND / WITHDRAW
 // simulate() (dry run + gas budget), depositCoin() (into Suilend / NAVI / a vault), build() (GET /build)
 // ══════════════════════════════════════════════════════════════════════════════════════════════════════════════
+// The current Sui epoch (24 h each on mainnet), cached 10 minutes; null when it cannot be read and no fresh value is cached.
+const EPOCH = { n: null as number | null, at: 0 };
+async function currentEpoch(): Promise<number | null> {
+  if (EPOCH.n != null && Date.now() - EPOCH.at < 600_000) return EPOCH.n;
+  try {
+    const r: any = await (grpc as any).core.getCurrentSystemState();
+    const n = Number(r?.systemState?.epoch);
+    if (Number.isFinite(n) && n > 0) { EPOCH.n = n; EPOCH.at = Date.now(); }
+  } catch (e: any) {
+    console.error('kivy-lend: epoch read failed:', String(e?.message ?? e).slice(0, 120));
+  }
+  return EPOCH.n != null && Date.now() - EPOCH.at < 12 * 3600_000 ? EPOCH.n : null;   // a value older than half an epoch could already be stale
+}
 // dry-runs a built transaction on Sui (chain.ts gRPC) and throws if it would fail; then sets the gas budget and checks the
-// wallet has the SUI for it. Every builder calls this before handing a transaction back. Returns the size in bytes.
+// wallet has the SUI for it, and bounds how long the signed bytes stay valid. Every builder calls this before handing a
+// transaction back. Returns the size in bytes.
 async function simulate(tx: Transaction) {
   const bytes = await tx.build({ client: grpc as any });
   // effects must be asked for: without them Sui returns no status and no gas numbers (2026-10-20: the check and the
@@ -373,7 +412,6 @@ async function simulate(tx: Transaction) {
     const comp = Number(g.computationCost ?? 0);
     const net = Math.max(comp + Number(g.storageCost ?? 0) - Number(g.storageRebate ?? 0), comp);
     (tx as any).__gas = { comp, storage: Number(g.storageCost ?? 0), rebate: Number(g.storageRebate ?? 0) };   // the real cost, for the dust sweep's sum
-    (tx as any).__bal = t?.balanceChanges ?? [];                     // who gets what: the dust sweep checks it against the page's guard
     const budget = BigInt(Math.ceil(net * 2)) + 20_000_000n;
     tx.setGasBudget(budget);
     const sender = (tx as any).getData?.().sender;
@@ -388,6 +426,16 @@ async function simulate(tx: Transaction) {
       if (have && have < need)
         throw new Error(`This needs about ${(Number(need) / 1e9).toFixed(3)} SUI in the wallet (incl. about ${(Number(budget) / 1e9).toFixed(3)} SUI set aside for the network fee — only the real fee is charged); your wallet has ${(Number(have) / 1e9).toFixed(3)} SUI. Use a little less SUI and try again.`);
     }
+  }
+  // Expiry (security gap 2026-11-08 #9): a transaction paying gas from SUI coins had none, so bytes a wallet signed but never
+  // sent stayed valid for ever. Now it is void after the NEXT epoch ends (24-48 h). Address-balance gas (no payment coins)
+  // already carries the library's ValidDuring window and is left alone; the page keeps the bound (classicGas carries it over).
+  const d: any = (tx as any).getData?.();
+  const ex = d?.expiration;
+  if ((d?.gasData?.payment?.length ?? 0) > 0 && (!ex || ex.None || ex.$kind === 'None')) {
+    const ep = await currentEpoch();
+    if (ep != null) tx.setExpiration({ Epoch: ep + 1 });
+    else console.error('kivy-lend: no epoch, transaction built without an expiry');
   }
   return bytes.length;
 }
@@ -519,7 +567,7 @@ async function build(addr: string, key: string, action: string, amountArg: strin
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════════════════════
 // [S5] SWAP ROUTERS
-// Aftermath router, then Cetus, then Bluefin 7k (routed / routeQuote / routeTrade), Kivy's swap + lend fees, allowlist
+// Aftermath router, then Cetus (routed / routeQuote / routeTrade), Kivy's swap + lend fees, allowlist
 // the plain swap card's check + backup (POST /swapcheck, /swapalt)
 // ══════════════════════════════════════════════════════════════════════════════════════════════════════════════
 // ── swap then lend, one transaction (2026-10-20) ──
@@ -554,15 +602,15 @@ function routeBlock(): string[] {
 }
 const withFee = (body: any) => { const f = revenueFee(), bl = routeBlock(); return { ...body, ...(f ? { externalFee: f } : {}), ...(bl.length ? { protocolBlacklist: bl } : {}) }; };
 
-// ── swap routers (2026-10-26: "A, add bluefin agg too") ──
+// ── swap routers (2026-10-26; Bluefin 7k dropped 2026-11-04: "we would do only aftermath and cetus") ──
 // Aftermath first. When its route fails (no route, or the test run aborts in the route — e.g. 1.3 USDC -> SUI aborted in
 // router::assert_acceptable_slippage_on_amount_out while other amounts worked), the WHOLE build runs again with the Cetus
-// aggregator, then with Bluefin 7k: same coins, same amount, same slippage, one approval. Left out of the backups: pools
+// aggregator: same coins, same amount, same slippage, one approval. Left out of the backups: pools
 // priced by Pyth (a paid feed now), Cetus Tide (order-book quotes that expire before the user approves) and blocked
 // protocols. A backup route may only call programs on Kivy's allowlist (/opt/kivy/kivy_pkgs.json, the list the server and
 // the page enforce): anything else and that router is skipped. Every swap site goes through routeQuote + routeTrade.
-const ROUTERS = ['aftermath', 'cetus', 'bluefin7k'] as const;
-const ROUTER_NAME: Record<string, string> = { aftermath: 'Aftermath', cetus: 'Cetus', bluefin7k: 'Bluefin 7k' };
+const ROUTERS = ['aftermath', 'cetus'] as const;
+const ROUTER_NAME: Record<string, string> = { aftermath: 'Aftermath', cetus: 'Cetus' };
 const routerCtx = new AsyncLocalStorage<{ router: string; swapped: boolean; n?: number }>();
 // tests only (tests/test_routers.py; command-line runs — the service never has this set): KIVY_ROUTER_FAULT="aftermath:abort,cetus:hang"
 // makes a router fail on purpose. Kinds: quote (no route), abort (the route aborts in the test run), hang (no answer), pkgs (the
@@ -581,11 +629,10 @@ function fault(r: string, stage: 'quote' | 'trade'): Promise<never> | null {
   return null;
 }
 // a failure of the swap route (worth another router), never a balance, amount or lending-protocol error
-const ROUTE_FAIL = /Aftermath router|router returned no swap|Cetus: |Bluefin 7k: |not on Kivy's list|assert_acceptable_slippage|MoveAbort[^']*'0x[0-9a-f]+::(?:router|pool|swap|trade|amm|clmm|lb_pair|settle|cetus|bluefin|aftermath|turbos|kriya|flowx|momentum|magma|ferra|bolt)::|MoveAbort[^']*'0x62412b7268c35f3808336aee57a52836501f40b8ba5d936f8ad275e672befd04::/i;
+const ROUTE_FAIL = /Aftermath router|router returned no swap|Cetus: |not on Kivy's list|assert_acceptable_slippage|MoveAbort[^']*'0x[0-9a-f]+::(?:router|pool|swap|trade|amm|clmm|lb_pair|settle|cetus|bluefin|aftermath|turbos|kriya|flowx|momentum|magma|ferra|bolt)::/i;
 async function routed<T>(f: () => Promise<T>, only?: string[]): Promise<T> {
   let first: any = null;
   const tried: string[] = [];
-  // tests only: KIVY_ROUTERS=cetus (or bluefin7k, or a comma list) forces the order on a command-line run
   // tests only: KIVY_ROUTERS=cetus (or a comma list) on a command-line run, or the file state/router-test (same text) for a live
   // test through the page — it counts only for 10 minutes after it was written, then everyone is back on Aftermath first
   let testOrder = process.env.KIVY_ROUTERS ?? '';
@@ -620,11 +667,12 @@ function allowedPkgs(): Set<string> {
   }
   return _pkgs.set;
 }
-function checkPkgs(kind: Uint8Array, who: string) {             // a backup route calls only programs the page will sign
+function checkPkgs(kind: Uint8Array, who: string) {             // every route calls only programs the page will sign
   const allow = allowedPkgs();
   for (const c of Transaction.fromKind(kind).getData().commands as any[]) {
     const pk = c.MoveCall?.package;
-    if (pk && !allow.has(normalizeSuiAddress(pk))) throw new Error(`${who}: route calls ${normalizeSuiAddress(pk).slice(0, 10)}…::${c.MoveCall.module}, not on Kivy's list`);
+    if (pk && !allow.has(normalizeSuiAddress(pk)))     // unlisted: the dust sweep drops that coin, every other build tries the next router
+      throw Object.assign(new Error(`${who}: route calls ${normalizeSuiAddress(pk).slice(0, 10)}…::${c.MoveCall.module}, not on Kivy's list`), { unlisted: true });
   }
 }
 const asArg = (a: any) => a && !a.$kind ? (a.NestedResult ? { $kind: 'NestedResult', ...a } : a.Result != null ? { $kind: 'Result', ...a } : a.Input != null ? { $kind: 'Input', ...a } : a) : a;
@@ -632,7 +680,6 @@ const blockedHas = (name: string) => routeBlock().some((b) => String(b).toLowerC
 const within = <T>(p: Promise<T>, ms: number, who: string) => Promise.race([p, new Promise<T>((_, no) => setTimeout(() => no(new Error(who + ': no answer in ' + ms / 1000 + ' s')), ms))]);
 let _cetus: any = null;
 const cetus = () => (_cetus ??= new CET.AggregatorClient({ env: CET.Env.Mainnet }));
-let _skInit = false;
 // a route for `body` ({coinInType, coinOutType, coinInAmount: "123n"}) from this build's router; coinOut.amount = expected out
 async function routeQuote(body: any): Promise<any> {
   const ctx = routerCtx.getStore(); if (ctx) { ctx.swapped = true; ctx.n = (ctx.n ?? 0) + 1; }
@@ -649,40 +696,37 @@ async function routeQuote(body: any): Promise<any> {
     if (!q || q.error || q.insufficientLiquidity || !(BigInt(q.amountOut?.toString() ?? '0') > 0n)) throw new Error('Cetus: no route' + (q?.error ? ' (' + JSON.stringify(q.error).slice(0, 80) + ')' : ''));
     return { coinOut: { amount: q.amountOut.toString() + 'n' }, __router: 'cetus', __q: q };
   }
-  if (!_skInit) { SK.Config.setSuiClient(grpc as any); _skInit = true; }
-  const sources = (SK.DEFAULT_SOURCES as string[]).filter((s) => !SK.ORACLE_BASED_SOURCES.has(s as any) && !blockedHas(s));
-  let q: any;
-  try { q = await within(SK.getQuote({ tokenIn: body.coinInType, tokenOut: body.coinOutType, amountIn: amt, sources: sources as any }), 10_000, 'Bluefin 7k'); }
-  catch (e: any) { throw new Error('Bluefin 7k: ' + String(e?.message ?? e).slice(0, 160)); }
-  const out = BigInt(String(q?.returnAmountWithDecimal ?? '0').split('.')[0] || '0');
-  if (!q?.routes?.length && !q?.swaps?.length || !(out > 0n)) throw new Error('Bluefin 7k: no route');
-  return { coinOut: { amount: out.toString() + 'n' }, __router: 'bluefin7k', __q: q };
+  throw new Error('Unknown swap router: ' + r);
 }
 // append the swap of `body.completeRoute` to body.txKind (base64), from body.coinInId; returns {txKind (base64), coinOutId}
+// small pieces every swap build shares (review code-waste CW-14, 2026-11-03): one copy each, same arithmetic as before
+const routeOut = (route: any): bigint => BigInt(String(route.coinOut?.amount ?? '0').replace('n', ''));   // the route's expected output, base units
+const minAfter = (exp: bigint, slip: number): bigint => exp * BigInt(Math.floor((1 - slip) * 1_000_000)) / 1_000_000n;   // the least it may deliver
+function lastSplit(resolved: any): number {                          // our split = the last SplitCoins after intents resolve (-1: none)
+  let at = -1;
+  resolved.commands.forEach((c: any, i: number) => { if (c.SplitCoins) at = i; });
+  return at;
+}
+function markPrices(m: any) { return af('markets/prices', { marketIds: [m.objectId] }); }
 async function routeTrade(body: any): Promise<{ txKind: string; coinOutId: any }> {
   const q = body.completeRoute;
   const f = fault(q?.__router ?? 'aftermath', 'trade'); if (f) await f;
-  if (!q?.__router) return afRouter('v1/transactions/add-trade', body);
-  const kind = Buffer.from(String(body.txKind), 'base64');
-  if (q.__router === 'cetus') {
-    let out: any, bytes: Uint8Array;
-    try {
-      const t = CetusTx.fromKind(kind); t.setSender(body.walletAddress);
-      out = await within(cetus().routerSwap({ router: q.__q, txb: t as any, inputCoin: asArg(body.coinInId), slippage: Number(body.slippage) }), 15_000, 'Cetus');
-      bytes = await t.build({ client: cetus().client, onlyTransactionKind: true } as any);
-    } catch (e: any) { throw new Error('Cetus: ' + String(e?.message ?? e).slice(0, 200)); }
-    checkPkgs(bytes, 'Cetus');
-    return { txKind: Buffer.from(bytes).toString('base64'), coinOutId: out };
+  if (!q?.__router) {
+    // Aftermath's reply is checked like the backups': a route through a program not on Kivy's list goes to the next router
+    // (Cetus) instead of reaching the page, whose check 1 refuses it (review H1, 2026-10-29 — it was never checked)
+    const r: any = await afRouter('v1/transactions/add-trade', body);
+    if (r?.txKind) checkPkgs(Buffer.from(String(r.txKind), 'base64'), 'Aftermath router');
+    return r;
   }
+  const kind = Buffer.from(String(body.txKind), 'base64');
+  if (q.__router !== 'cetus') throw new Error('Unknown swap router: ' + q.__router);
   let out: any, bytes: Uint8Array;
   try {
-    const t0 = Transaction.fromKind(kind); t0.setSender(body.walletAddress);
-    const r: any = await within(SK.buildTx({ quoteResponse: q.__q, accountAddress: body.walletAddress, slippage: Number(body.slippage),
-                                      commission: { partner: body.walletAddress, commissionBps: 0 }, extendTx: { tx: t0 as any, coinIn: asArg(body.coinInId) } }), 15_000, 'Bluefin 7k');
-    out = r.coinOut;
-    bytes = await (r.tx as Transaction).build({ client: grpc as any, onlyTransactionKind: true });
-  } catch (e: any) { throw new Error('Bluefin 7k: ' + String(e?.message ?? e).slice(0, 200)); }
-  checkPkgs(bytes, 'Bluefin 7k');
+    const t = CetusTx.fromKind(kind); t.setSender(body.walletAddress);
+    out = await within(cetus().routerSwap({ router: q.__q, txb: t as any, inputCoin: asArg(body.coinInId), slippage: Number(body.slippage) }), 15_000, 'Cetus');
+    bytes = await t.build({ client: cetus().client, onlyTransactionKind: true } as any);
+  } catch (e: any) { throw new Error('Cetus: ' + String(e?.message ?? e).slice(0, 200)); }
+  checkPkgs(bytes, 'Cetus');
   return { txKind: Buffer.from(bytes).toString('base64'), coinOutId: out };
 }
 // the lending-deposit fee (same switch + address): a fraction of the deposit coin, paid to the address, before it goes in
@@ -703,7 +747,7 @@ function takeLendFee(tx: Transaction, coin: any, base: bigint) {   // base = wha
 }
 // ── the plain swap card's backup (2026-10-26) ──
 // The server builds a plain swap with Aftermath's trade endpoint and never ran it. swapCheck runs that transaction for the
-// wallet first; when the route fails, swapAlt builds the same swap (same coins, amount, slippage) with Cetus, then Bluefin 7k.
+// wallet first; when the route fails, swapAlt builds the same swap (same coins, amount, slippage) with Cetus.
 async function swapCheck(addr: string, kindB64: string) {
   const tx = Transaction.fromKind(Buffer.from(kindB64, 'base64')); tx.setSender(addr);
   try { await simulate(tx); return { ok: true }; }
@@ -721,7 +765,7 @@ async function swapAlt(addr: string, fromType: string, toType: string, base: big
     const resolved = JSON.parse(await tx.toJSON({ client: grpc as any }));
     const kind = await tx.build({ client: grpc as any, onlyTransactionKind: true });
     const route = await routeQuote({ coinInType: fromType, coinOutType: toType, coinInAmount: base.toString() + 'n' });
-    const exp0 = BigInt(String(route.coinOut?.amount ?? '0').replace('n', ''));
+    const exp0 = routeOut(route);
     if (minOut > 0n) {                                   // the minimum the user approved is what the CHAIN enforces (audit nv #5):
       if (exp0 * 9999n / 10000n < minOut) throw new Error(`${ROUTER_NAME[routerCtx.getStore()?.router ?? 'cetus']}: price moved — this route gives less than the minimum you approved`);
       slip = Math.min(slip, Math.max(0.0001, 1 - (Number(minOut) + 2) / Number(exp0)));   // tighter, never looser; +2 units so rounding never lands under
@@ -730,10 +774,10 @@ async function swapAlt(addr: string, fromType: string, toType: string, base: big
     const t2 = Transaction.fromKind(r.txKind); t2.setSender(addr);
     t2.transferObjects([r.coinOutId as any], addr);
     await simulate(t2);
-    const exp = BigInt(String(route.coinOut?.amount ?? '0').replace('n', ''));
+    const exp = routeOut(route);
     return { ok: true, tx_kind: Buffer.from(await t2.build({ client: grpc as any, onlyTransactionKind: true })).toString('base64'),
-             expected_base: exp.toString(), min_base: (exp * BigInt(Math.floor((1 - slip) * 1_000_000)) / 1_000_000n).toString() };
-  }, ['cetus', 'bluefin7k']);
+             expected_base: exp.toString(), min_base: minAfter(exp, slip).toString() };
+  }, ['cetus']);
 }
 // ══════════════════════════════════════════════════════════════════════════════════════════════════════════════
 // [S6] MULTI-STEP BUILDS
@@ -758,13 +802,13 @@ async function buildSwapLend(addr: string, key: string, fromSym: string, toSym: 
                                                           slippage: slip, walletAddress: addr, coinInId: coinArg(resolved) });
   if (!r.txKind || !r.coinOutId) throw new Error('Aftermath router returned no swap');
   const t2 = Transaction.fromKind(r.txKind); t2.setSender(addr);
-  const minOut = BigInt(Math.floor(Number(String(route.coinOut?.amount ?? '0').replace('n', '')) * (1 - slip)));
+  const minOut = minAfter(routeOut(route), slip);
   takeLendFee(t2, r.coinOutId, minOut);                 // on what the swap is sure to deliver
   await depositCoin(t2, m, B, r.coinOutId, addr);
   let size = 0;
   try { size = await simulate(t2); }
   catch (e: any) { throw new Error('This swap-then-lend would fail right now: ' + String(e?.message ?? e).slice(0, 160)); }
-  const out = Number(String(route.coinOut?.amount ?? '0').replace('n', '')) / 10 ** B.dec;
+  const out = Number(routeOut(route)) / 10 ** B.dec;
   return { ok: true, market: key, fee_pct: (revenueFee()?.feePercentage ?? 0) * 100, from: A.sym, to: B.sym, from_type: A.type, from_decimals: A.dec, to_type: B.type, amount,
            expected_out: out, min_out: out * (1 - slip), tx: await t2.toJSON({ client: grpc as any }), bytes: size };
 }
@@ -799,20 +843,18 @@ async function buildWithdrawSwap(addr: string, key: string, sym: string, amountA
   const base = BigInt(Math.floor(Number(w.amount) * 10 ** C.dec * 0.9999)) - 1n;
   if (base <= 0n) throw new Error('Too little to swap');
   const route = await routeQuote(({ coinInType: C.type, coinOutType: T.type, coinInAmount: base.toString() + 'n' }));
-  const [piece] = tx.splitCoins(coin, [base]);
+  tx.splitCoins(coin, [base]);
   tx.transferObjects([coin], addr);                                  // the remainder (dust) back to the wallet
   const resolved = JSON.parse(await tx.toJSON({ client: grpc as any }));
   const kind = await tx.build({ client: grpc as any, onlyTransactionKind: true });
-  let at = -1;                                                       // our split = the last SplitCoins after intents resolve
-  resolved.commands.forEach((c: any, i: number) => { if (c.SplitCoins) at = i; });
+  const at = lastSplit(resolved);
   if (at < 0) throw new Error('could not place the swap');
-  void piece;
   const r = await routeTrade({ txKind: Buffer.from(kind).toString('base64'), completeRoute: route,
                                                           slippage: slipFor(C.sym, T.sym), walletAddress: addr, coinInId: { NestedResult: [at, 0] } });
   if (!r.txKind || !r.coinOutId) throw new Error('Aftermath router returned no swap');
   const t2 = Transaction.fromKind(r.txKind); t2.setSender(addr);
   if (M2) {                                                          // move: the swapped coin goes straight into the new market
-    takeLendFee(t2, r.coinOutId, BigInt(Math.floor(Number(String(route.coinOut?.amount ?? '0').replace('n', '')) * (1 - slipFor(C.sym, T.sym)))));
+    takeLendFee(t2, r.coinOutId, minAfter(routeOut(route), slipFor(C.sym, T.sym)));
     await depositCoin(t2, M2, T, r.coinOutId, addr);
   } else t2.transferObjects([r.coinOutId as any], addr);
   let size = 0;
@@ -822,7 +864,7 @@ async function buildWithdrawSwap(addr: string, key: string, sym: string, amountA
       throw new Error(`Your ${byKey(key).name} account also holds coins whose price isn't fresh on chain right now — try again in a minute.`);
     throw new Error('This withdraw-and-swap would fail right now: ' + String(e?.message ?? e).slice(0, 160));
   }
-  const out = Number(String(route.coinOut?.amount ?? '0').replace('n', '')) / 10 ** T.dec;
+  const out = Number(routeOut(route)) / 10 ** T.dec;
   return { ok: true, market: key, lend_to: M2?.key ?? null, coin: C.sym, coin_type: C.type, to: T.sym, to_type: T.type, amount: w.amount,
            expected_out: out, min_out: out * (1 - slipFor(C.sym, T.sym)), tx: await t2.toJSON({ client: grpc as any }), bytes: size };
 }
@@ -841,20 +883,18 @@ async function swapInHand(h: Hand, B: Coin, addr: string): Promise<Hand & { exp:
   const base = h.est;
   if (base <= 0n) throw new Error('Too little to swap');
   const route = await routeQuote(({ coinInType: h.C.type, coinOutType: B.type, coinInAmount: base.toString() + 'n' }));
-  const [piece] = h.tx.splitCoins(h.coin, [base]);
-  void piece;
+  h.tx.splitCoins(h.coin, [base]);
   h.tx.transferObjects([h.coin], addr);                              // remainder (dust / slippage surplus) back to the wallet
   const resolved = JSON.parse(await h.tx.toJSON({ client: grpc as any }));
   const kind = await h.tx.build({ client: grpc as any, onlyTransactionKind: true });
-  let at = -1;
-  resolved.commands.forEach((c: any, i: number) => { if (c.SplitCoins) at = i; });
+  const at = lastSplit(resolved);
   if (at < 0) throw new Error('could not place the swap');
   const r = await routeTrade({ txKind: Buffer.from(kind).toString('base64'), completeRoute: route,
                                                           slippage: slipFor(h.C.sym, B.sym), walletAddress: addr, coinInId: { NestedResult: [at, 0] } });
   if (!r.txKind || !r.coinOutId) throw new Error('Aftermath router returned no swap');
   const t2 = Transaction.fromKind(r.txKind); t2.setSender(addr);
-  const exp = BigInt(String(route.coinOut?.amount ?? '0').replace('n', ''));
-  const min = exp * BigInt(Math.floor((1 - slipFor(h.C.sym, B.sym)) * 1_000_000)) / 1_000_000n;
+  const exp = routeOut(route);
+  const min = minAfter(exp, slipFor(h.C.sym, B.sym));
   return { tx: t2, coin: r.coinOutId, C: B, est: min, exp };
 }
 
@@ -869,7 +909,7 @@ async function buildCompose(addr: string, spec: any) {
   const plan: any[] = [];
   if (src.op === 'wallet') {
     const C = await coinOf('', src.coin);
-    const base = BigInt(Math.floor(Number(src.amount) * 10 ** C.dec));
+    const base = toUnits(src.amount, C.dec);
     if (!(base > 0n)) throw new Error('Enter an amount to start with');
     const tx = new Transaction(); tx.setSender(addr);
     const coin = tx.add(coinWithBalance({ type: C.type, balance: base }));
@@ -923,7 +963,7 @@ async function buildCompose(addr: string, spec: any) {
   } else throw new Error('Start with a coin from the wallet, a withdrawal or your dust');
   // the wallet's own coins of the same kind, merged in ("…including my remaining USDC in wallet" — 2026-10-21)
   if (src.plus != null && src.op !== 'wallet') {
-    const add = BigInt(Math.floor(Number(src.plus) * 10 ** h.C.dec));
+    const add = toUnits(src.plus, h.C.dec);
     if (!(add > 0n)) throw new Error('Nothing to add from the wallet');
     const extra = h.tx.add(coinWithBalance({ type: h.C.type, balance: add }));
     h.tx.mergeCoins(h.coin, [extra]);
@@ -932,13 +972,18 @@ async function buildCompose(addr: string, spec: any) {
   }
   // fan-out (2026-10-24: "withdraw hasui from navi, then 25% each into USDC, USDsui, SUI and deep then deposit into suilend"):
   // every final step names its own coin ('to'). The coin in hand is cut into one piece per step in ONE split, each piece is
-  // swapped on its own route, then lent or kept. Lend / keep only; the leftover of the split (dust) goes back to the wallet.
-  if (sinks.some((k) => k.to && !/^0x/i.test(String(k.to)))) {                // a send's 'to' is an address, not a coin
+  // swapped on its own route, then lent, sent or kept; the leftover of the split (dust) goes back to the wallet.
+  // A send names its coin in 'coin' (its 'to' is the address) — "swap a third to SUI, send the SUI to 0x…" (2026-11-08).
+  const fanCoin = (k: any) => k.op === 'send' ? k.coin : k.to;
+  if (sinks.some((k) => (k.to && !/^0x/i.test(String(k.to))) || k.coin)) {
     if (swaps.length) throw new Error('Split into several coins OR swap first, not both');
-    if (sinks.some((k) => !['lend', 'keep'].includes(k.op))) throw new Error('Each coin of a split can be lent or kept');
+    if (sinks.some((k) => !['lend', 'keep', 'send', 'perps'].includes(k.op))) throw new Error('Each coin of a split can be lent, sent, kept or put into perps');
+    if (sinks.filter((k) => k.op === 'perps').length > 1) throw new Error('One perps deposit per transaction');
+    if (sinks.some((k) => k.op === 'send' && !/^0x[0-9a-fA-F]{64}$/.test(String(k.to)))) throw new Error('Send needs a full 0x address');
     const E = h.est;
-    const want = (k: any) => k.amount?.rest ? null : k.amount?.units != null ? BigInt(Math.floor(Number(k.amount.units) * 10 ** h.C.dec))
+    const want = (k: any) => k.amount?.rest ? null : k.amount?.raw != null ? k.amount.raw : k.amount?.units != null ? toUnits(k.amount.units, h.C.dec)
                            : k.amount?.frac != null ? BigInt(Math.floor(Number(E) * Number(k.amount.frac))) : null;
+    trimDust(sinks, want, E);
     const fixed = sinks.map(want).filter((x) => x != null) as bigint[];
     const sum = fixed.reduce((t, x) => t + x, 0n);
     if (sum > E) throw new Error(`Those amounts add up to more than the ${Number(E) / 10 ** h.C.dec} ${h.C.sym} you'd have`);
@@ -947,36 +992,53 @@ async function buildCompose(addr: string, spec: any) {
     h.tx.splitCoins(h.coin, amts);
     h.tx.transferObjects([h.coin], addr);                              // what the split leaves (dust) back to the wallet
     const resolved = JSON.parse(await h.tx.toJSON({ client: grpc as any }));
-    let at = -1;
-    resolved.commands.forEach((c: any, i: number) => { if (c.SplitCoins) at = i; });
+    const at = lastSplit(resolved);
     if (at < 0) throw new Error('could not place the split');
     let kind = await h.tx.build({ client: grpc as any, onlyTransactionKind: true });
     const legs: { coin: any; C: Coin; est: bigint }[] = [];
     for (let i = 0; i < sinks.length; i++) {
       const piece = { $kind: 'NestedResult', NestedResult: [at, i] } as any;
-      const B = await coinOf('', sinks[i].to ?? h.C.sym);
+      const B = await coinOf('', fanCoin(sinks[i]) ?? h.C.sym);
       if (normType(B.type) === normType(h.C.type)) { legs.push({ coin: piece, C: h.C, est: amts[i] }); continue; }
       const route = await routeQuote(({ coinInType: h.C.type, coinOutType: B.type, coinInAmount: amts[i].toString() + 'n' }));
       const r = await routeTrade({ txKind: Buffer.from(kind).toString('base64'), completeRoute: route,
                                                               slippage: slipFor(h.C.sym, B.sym), walletAddress: addr, coinInId: { NestedResult: [at, i] } });
       if (!r.txKind || !r.coinOutId) throw new Error('Aftermath router returned no swap');
       kind = Buffer.from(r.txKind, 'base64');
-      const exp = BigInt(String(route.coinOut?.amount ?? '0').replace('n', ''));
-      const min = exp * BigInt(Math.floor((1 - slipFor(h.C.sym, B.sym)) * 1_000_000)) / 1_000_000n;
+      const exp = routeOut(route);
+      const min = minAfter(exp, slipFor(h.C.sym, B.sym));
       plan.push({ op: 'swap', from: h.C.sym, to: B.sym, in: Number(amts[i]) / 10 ** h.C.dec, expected: Number(exp) / 10 ** B.dec, min: Number(min) / 10 ** B.dec });
       legs.push({ coin: r.coinOutId, C: B, est: min });
     }
-    const tx = Transaction.fromKind(kind); tx.setSender(addr);
+    let tx = Transaction.fromKind(kind); tx.setSender(addr);
+    let perpLeg: { coin: any; est: bigint } | null = null;
     for (let i = 0; i < sinks.length; i++) {
       const k = sinks[i], L = legs[i];
+      if (k.op === 'perps') {                                              // margin: Aftermath appends its deposit, so it goes in last (below)
+        if (normType(L.C.type) !== normType(USDC)) throw new Error('Perps margin is USDC — swap that part to USDC first');
+        perpLeg = { coin: L.coin, est: L.est };
+        plan.push({ op: 'perps', coin: 'USDC', type: L.C.type, dec: L.C.dec, amount: Number(L.est) / 1e6, rest: false });
+        continue;
+      }
       if (k.op === 'lend') {
         const M = byKey(k.market);
         const C2 = await coinOf(k.market, L.C.sym).catch(() => L.C);
         if (normType(C2.type) !== normType(L.C.type)) throw new Error(`${M.name} doesn't take ${L.C.sym}`);
         takeLendFee(tx, L.coin, L.est);
         await depositCoin(tx, M, L.C, L.coin, addr);
-      } else tx.transferObjects([L.coin], addr);
-      plan.push({ op: k.op, market: k.market, coin: L.C.sym, type: L.C.type, dec: L.C.dec, amount: Number(L.est) / 10 ** L.C.dec, rest: false });
+      } else if (k.op === 'send') tx.transferObjects([L.coin], k.to);
+      else tx.transferObjects([L.coin], addr);
+      plan.push({ op: k.op, market: k.market, ...(k.op === 'send' ? { to: k.to } : {}), coin: L.C.sym, type: L.C.type, dec: L.C.dec,
+                  amount: Number(L.est) / 10 ** L.C.dec, rest: false });
+    }
+    if (perpLeg) {                                                         // "swap 60% to USDC, deposit that into perps, keep the rest" (2026-11-08)
+      const acct: any = await perpAccount(addr);
+      if (!acct.has) throw new Error('Open an Aftermath perps account first (say "open perps account")');
+      const k2 = await tx.build({ client: grpc as any, onlyTransactionKind: true });
+      const arg = perpLeg.coin?.NestedResult ? { NestedResult: perpLeg.coin.NestedResult } : perpLeg.coin?.Result != null ? { Result: perpLeg.coin.Result } : perpLeg.coin;
+      const r = await af('account/transactions/deposit-collateral', { walletAddress: addr, accountId: acct.accountId, accountCapId: acct.capId,
+        collateralCoinType: USDC, txKind: Buffer.from(k2).toString('base64'), depositCoinArg: arg });
+      tx = Transaction.fromKind(r.txKind); tx.setSender(addr);
     }
     let size = 0;
     try { size = await simulate(tx); }
@@ -998,8 +1060,9 @@ async function buildCompose(addr: string, spec: any) {
   }
   // final steps: explicit pieces first, the "rest" (or the last step) takes whatever is left
   const E = h.est;
-  const want = (k: any) => k.amount?.units != null ? BigInt(Math.floor(Number(k.amount.units) * 10 ** h.C.dec))
+  const want = (k: any) => k.amount?.raw != null ? k.amount.raw : k.amount?.units != null ? toUnits(k.amount.units, h.C.dec)
                          : k.amount?.frac != null ? BigInt(Math.floor(Number(E) * Number(k.amount.frac))) : null;
+  trimDust(sinks.filter((k) => !k.amount?.rest), want, E);
   const fixed = sinks.filter((k) => !k.amount?.rest && want(k) != null);
   const total = fixed.reduce((t, k) => t + (want(k) as bigint), 0n);
   if (total > E) throw new Error(`Those amounts add up to more than the ${Number(E) / 10 ** h.C.dec} ${h.C.sym} you'd have`);
@@ -1042,8 +1105,7 @@ async function buildCompose(addr: string, spec: any) {
     h.tx.transferObjects([h.coin], addr);                              // anything above the planned amount stays yours
     const resolved = JSON.parse(await h.tx.toJSON({ client: grpc as any }));
     const kind = await h.tx.build({ client: grpc as any, onlyTransactionKind: true });
-    let at = -1;
-    resolved.commands.forEach((c: any, i: number) => { if (c.SplitCoins) at = i; });
+    const at = lastSplit(resolved);
     const r = await af('account/transactions/deposit-collateral', { walletAddress: addr, accountId: acct.accountId, accountCapId: acct.capId,
       collateralCoinType: USDC, txKind: Buffer.from(kind).toString('base64'), depositCoinArg: { NestedResult: [at, 0] } });
     h.tx = Transaction.fromKind(r.txKind); h.tx.setSender(addr);
@@ -1130,20 +1192,31 @@ async function dustTx(addr: string, B: Coin, legs: any[], skipped: any[], hand =
   for (const L of legs) {
     const slip = slipFor(L.sym, B.sym);
     L.from = Transaction.fromKind(kind).getData().commands.length;        // this coin's swap commands, to name it if one aborts
-    const r = await routeTrade({ txKind: Buffer.from(kind).toString('base64'), completeRoute: L.route,
-                                                            slippage: slip, walletAddress: addr, coinInId: { NestedResult: [L.at, 0] } });
+    let r: any;
+    try {
+      r = await routeTrade({ txKind: Buffer.from(kind).toString('base64'), completeRoute: L.route,
+                             slippage: slip, walletAddress: addr, coinInId: { NestedResult: [L.at, 0] } });
+    } catch (e: any) {                                                   // its route uses an unlisted program: drop this coin only
+      if (e?.unlisted) throw Object.assign(new Error('unverified program'), { badLeg: legs.indexOf(L) });
+      throw e;
+    }
     if (!r.txKind || !r.coinOutId) throw new Error('Aftermath router returned no swap for ' + L.sym);
     kind = Buffer.from(r.txKind, 'base64');
     L.to = Transaction.fromKind(kind).getData().commands.length;
-    L.min = L.exp * BigInt(Math.floor((1 - slip) * 1_000_000)) / 1_000_000n;
+    L.min = minAfter(L.exp, slip);
     expT += L.exp; minT += L.min;
     outs.push(r.coinOutId);
   }
   const tx2 = Transaction.fromKind(kind); tx2.setSender(addr);
   const allow = dustAllow();                                          // the same list the page checks before signing (kivy_pkgs.json)
-  if (allow.size) tx2.getData().commands.forEach((c: any, i: number) => {
+  if (!allow.size) throw new Error('Kivy could not read its list of verified programs, so nothing was prepared');   // fail closed (L3)
+  tx2.getData().commands.forEach((c: any, i: number) => {
     const pkg = c.MoveCall && normType(c.MoveCall.package + '::a::b').split('::')[0];
-    if (pkg && !allow.has(pkg)) { const bad = legs.findIndex((L) => i >= L.from && i < L.to); if (bad >= 0) throw Object.assign(new Error('unverified program'), { badLeg: bad }); }
+    if (pkg && !allow.has(pkg)) {                                      // inside a leg: drop that coin and retry; outside every leg: refuse (review L3)
+      const bad = legs.findIndex((L) => i >= L.from && i < L.to);
+      if (bad >= 0) throw Object.assign(new Error('unverified program'), { badLeg: bad });
+      throw new Error('This dust sweep would call a program Kivy hasn\'t verified, so nothing was prepared');
+    }
   });
   if (outs.length > 1) tx2.mergeCoins(outs[0], outs.slice(1));
   if (hand) return { tx: tx2, coin: outs[0], min: minT };              // a chain's next steps take the swept coin from here
@@ -1178,14 +1251,14 @@ async function buildSendMany(addr: string, lines: any[]) {
     if (!(Number(l.amount) > 0) && l.amount !== 'all') throw new Error('Every transfer needs an amount');
     if (l.source && l.source !== 'wallet') { const k = l.source + '|' + l.coin; groups.set(k, [...(groups.get(k) ?? []), l]); continue; }
     const C = await coinOf('', l.coin);
-    const base = BigInt(Math.floor(Number(l.amount) * 10 ** C.dec));
+    const base = toUnits(l.amount, C.dec);
     tx.transferObjects([tx.add(coinWithBalance({ type: C.type, balance: base }))], tx.pure.address(l.to));
     plan.push({ op: 'send', source: 'wallet', coin: C.sym, coin_type: C.type, dec: C.dec, amount: Number(base) / 10 ** C.dec, to: l.to });
   }
   for (const [k, ls] of groups) {
     const [market, coin] = k.split('|');
     const all = ls.length === 1 && ls[0].amount === 'all';
-    const total = all ? 'all' : String(ls.reduce((t: number, x: any) => t + Number(x.amount), 0));
+    const total = all ? 'all' : unitsText(ls.reduce((t: bigint, x: any) => t + toUnits(x.amount, 18), 0n), 18);   // exact sum, no float drift
     const keep: any[] = [];
     const w: any = await build(addr, market, 'withdraw', total, coin, keep, tx);
     if (!keep.length) throw new Error('Nothing to withdraw from ' + byKey(market).name);
@@ -1195,7 +1268,7 @@ async function buildSendMany(addr: string, lines: any[]) {
     ls.forEach((l: any, i: number) => {
       const last = i === ls.length - 1;
       const amt = all ? Number(w.amount) : Number(l.amount);
-      const part = last ? c0 : tx.splitCoins(c0, [BigInt(Math.floor(amt * 10 ** w.C.dec))])[0];
+      const part = last ? c0 : tx.splitCoins(c0, [toUnits(l.amount, w.C.dec)])[0];
       tx.transferObjects([part], tx.pure.address(l.to));
       plan.push({ op: 'send', source: market, coin: w.C.sym, coin_type: w.C.type, dec: w.C.dec, amount: amt, to: l.to, rest: last });
     });
@@ -1289,7 +1362,7 @@ const _meta = new Map<string, Promise<{ symbol: string; decimals: number }>>();
 function coinMeta(t: string) {
   if (!_meta.has(t)) _meta.set(t, (async () => {
     const q = { query: `{ coinMetadata(coinType: "${t}") { symbol decimals } }` };
-    const r: any = await (await fetch('https://graphql.mainnet.sui.io/graphql', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(q) })).json();
+    const r: any = await (await fetch('https://graphql.mainnet.sui.io/graphql', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(q), signal: AbortSignal.timeout(20_000) })).json();
     const m = r?.data?.coinMetadata ?? {};
     return { symbol: m.symbol ?? t.split('::').pop(), decimals: Number(m.decimals ?? 9) };
   })());
@@ -1299,7 +1372,7 @@ function coinMeta(t: string) {
 async function usdPrices(types: string[]) {
   if (!types.length) return {} as Record<string, number>;
   try {
-    const r: any = await (await fetch('https://aftermath.finance/api/price-info', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ coins: types }) })).json();
+    const r: any = await (await fetch('https://aftermath.finance/api/price-info', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ coins: types }), signal: AbortSignal.timeout(20_000) })).json();
     return Object.fromEntries(types.map((t) => [t, Math.max(0, Number(r?.[t]?.price ?? 0))]));
   } catch { return {} as Record<string, number>; }
 }
@@ -1389,7 +1462,7 @@ async function buildClaim(addr: string, only: string) {
 const AF = 'https://aftermath.finance/api/perpetuals/';
 // POST to Aftermath's perpetuals API (AF + path); returns its JSON or throws 'Aftermath: …'
 async function af(path: string, body: any) {
-  const r = await fetch(AF + path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  const r = await fetch(AF + path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal: AbortSignal.timeout(20_000) });   // a hung Aftermath must not hold a build slot (review 2026-11-04 S5)
   const t = await r.text();
   let j: any; try { j = JSON.parse(t); } catch { throw new Error('Aftermath: ' + t.slice(0, 160)); }
   if (!r.ok || j?.error || typeof j === 'string') throw new Error('Aftermath: ' + String(j?.error ?? j?.message ?? t).slice(0, 200));
@@ -1398,8 +1471,8 @@ async function af(path: string, body: any) {
 // The USDC coin Kivy built: coinWithBalance resolves to a SplitCoins (from coins, or from the address
 // balance via redeem_funds; send_funds may follow to return change), so the coin is that split's output.
 function coinArg(resolved: any) {
-  for (let i = resolved.commands.length - 1; i >= 0; i--) if (resolved.commands[i].SplitCoins) return { NestedResult: [i, 0] };
-  return { Result: resolved.commands.length - 1 };
+  const i = lastSplit(resolved);
+  return i >= 0 ? { NestedResult: [i, 0] } : { Result: resolved.commands.length - 1 };
 }
 // GET /perp-account — the wallet's USDC perps account: id, cap, free collateral. Caller: server.py perp_account().
 // Every perps builder starts here.
@@ -1509,6 +1582,77 @@ async function perpGuard(tx: Transaction, addr: string) {
       if (!(got > 0) || Math.abs(got - lev) / lev > 0.1) perpRefuse(`its leverage is about ${got.toFixed(2)}x, you asked for ${lev}x`, cmd);
     }
   }
+  // pro orders (review M2, 2026-10-29): what the chain places must be what was asked. A limit / scale order's side and price sit
+  // in its order id (top 64 bits: an ask = price × 1e9, a bid = 2^64-1 minus that) and its size in PostedOrder. Stop, TP and SL
+  // tickets keep their trigger prices hashed with a salt only Aftermath holds (encrypted_details), so for those the chain
+  // shows only how many tickets, of which kind, and that nothing is placed or filled now — that much is checked.
+  const posted = evs.filter((e: any) => e.type.endsWith('::events::PostedOrder'));
+  const takes = evs.filter((e: any) => e.type.endsWith('::events::FilledTakerOrder'));
+  const tickets = evs.filter((e: any) => /::events::CreatedStopOrderTicket(<|$)/.test(e.type));
+  const num = (i: number) => Number(a[i]) || 0;
+  const mk: any = sym && ['perp-limit', 'perp-scale', 'perp-close'].includes(cmd) ? await perpMarket(sym).catch(() => null) : null;
+  const tick = Number(String(mk?.marketParams?.tickSize ?? '0').replace('n', '')) / PX_DEC;
+  const lot = Number(String(mk?.marketParams?.lotSize ?? '0').replace('n', '')) / SIZE_DEC;
+  const fillOf = (f: any) => {
+    const bid = BigInt(f.j.base_asset_delta_bid ?? 0), ask = BigInt(f.j.base_asset_delta_ask ?? 0);
+    return { bid, ask, base: Number(bid + ask) / 1e18, quote: Number(BigInt(f.j.quote_asset_delta_bid ?? 0) + BigInt(f.j.quote_asset_delta_ask ?? 0)) / 1e18 };
+  };
+  const ticketsAre = (lo: number, hi: number, kind: string) => {   // kind: '0' = TP / SL on a position, '1' = a stop order
+    if (tickets.length < lo || tickets.length > hi) perpRefuse(`it sets ${tickets.length} stop / take-profit orders, you asked for ${lo === hi ? lo : lo + '–' + hi}`, cmd);
+    if (tickets.some((e: any) => String(e.j.stop_order_type) !== kind)) perpRefuse('it sets another kind of stop order than you asked for', cmd);
+  };
+  const nothingNow = () => { if (posted.length || takes.length) perpRefuse('it places or fills an order now', cmd); };
+  if (cmd === 'perp-limit' || cmd === 'perp-scale') {
+    const side = num(2), usd = num(3), lev = num(4), n = cmd === 'perp-scale' ? num(7) : 1;
+    const lo = cmd === 'perp-limit' ? num(5) : Math.min(num(5), num(6)), hi = cmd === 'perp-limit' ? num(5) : Math.max(num(5), num(6));
+    const room = (p: number) => Math.max(p * 0.001, tick);              // 0.1 %, or one price tick when that is coarser
+    let base = 0;
+    for (const e of posted) {
+      const hi64 = BigInt(String(e.j.order_id ?? 0)) >> 64n, bid = hi64 >= (1n << 63n);
+      const px = Number(bid ? (1n << 64n) - 1n - hi64 : hi64) / PX_DEC;
+      if (bid !== (side === 0)) perpRefuse(`it places a ${bid ? 'long' : 'short'} order, you asked for a ${side === 0 ? 'long' : 'short'}`, cmd);
+      if (px < lo - room(lo) || px > hi + room(hi)) perpRefuse(`its order price is ${px}, you asked for ${lo === hi ? lo : lo + '–' + hi}`, cmd);
+      if (e.j.reduce_only === true) perpRefuse('it places a reduce-only order, you asked to open one', cmd);
+      base += Number(BigInt(String(e.j.order_size ?? 0))) / SIZE_DEC;
+    }
+    for (const f of takes) {                            // a limit that crosses the book fills now: same side, at its price or better
+      const x = fillOf(f);
+      if (side === 0 ? !(x.bid > 0n && x.ask === 0n) : !(x.ask > 0n && x.bid === 0n)) perpRefuse(`it fills a ${side === 0 ? 'short' : 'long'}, you asked for a ${side === 0 ? 'long' : 'short'}`, cmd);
+      if (x.base > 0 && (side === 0 ? x.quote / x.base > hi + room(hi) : x.quote / x.base < lo - room(lo))) perpRefuse(`it fills at about ${(x.quote / x.base).toPrecision(6)}, past your price`, cmd);
+      base += x.base;
+    }
+    if (!posted.length && !takes.length) perpRefuse('it places no order', cmd);
+    if (cmd === 'perp-scale' && posted.length > n) perpRefuse(`it places ${posted.length} orders, you asked for ${n}`, cmd);
+    const asked = usd > 0 ? usd / (cmd === 'perp-limit' ? lo : (lo + hi) / 2) : 0;   // the builder sizes it usd / price, lot-rounded down
+    if (asked > 0 && base > asked * 1.001 + 1e-12) perpRefuse(`its size is ${base} ${sym}, you asked for about ${Number(asked.toPrecision(6))}`, cmd);
+    if (asked > 0 && base < asked * 0.999 - lot * n - 1e-12) perpRefuse(`its size is ${base} ${sym}, you asked for about ${Number(asked.toPrecision(6))}`, cmd);
+    const imr = evs.find((e: any) => e.type.endsWith('::events::SetPositionInitialMarginRatio'));
+    if (imr && lev > 0 && Math.abs(1e18 / Number(imr.j.initial_margin_ratio) - lev) / lev > 0.05)
+      perpRefuse(`its leverage is ${(1e18 / Number(imr.j.initial_margin_ratio)).toFixed(2)}x, you asked for ${lev}x`, cmd);
+    if (cmd === 'perp-limit') { const k = num(7) > 0 || num(8) > 0 ? 1 : 0; ticketsAre(k, k, '0'); } else ticketsAre(0, 0, '0');
+  }
+  if (cmd === 'perp-stop') { nothingNow(); ticketsAre(1, 1, '1'); }
+  if (cmd === 'perp-tpsl') {                            // one order for all, or TP1 + (TP2) + (SL) as buildTpSl places them
+    const sl = num(2), tp = num(3), frac = num(4) || 1, tp2 = num(5);
+    const k = !(tp > 0) || frac >= 1 ? 1 : 1 + (sl > 0 ? 1 : 0) + (tp2 > 0 ? 1 : 0);
+    nothingNow(); ticketsAre(tp2 > 0 && k > 1 ? k - 1 : k, k, '0');     // TP2 is left out when TP1 already takes the whole size
+  }
+  if (cmd === 'perp-tpsl-multi') {
+    const tps = String(a[3] || '').split('-').filter(Boolean).map((p) => Number(p.split('x')[0])).filter((p) => p > 0).slice(0, 3);
+    const k = tps.length + (num(2) > 0 ? 1 : 0);
+    nothingNow(); ticketsAre(k, k, '0');
+  }
+  if (cmd === 'perp-close') {                           // the other side of the position, and frac of its size (lot-rounded down)
+    const frac = num(3) || 1;
+    const { pos } = await openPos(addr, sym);
+    const size = Math.abs(Number(pos.baseAssetAmount)), long = Number(pos.baseAssetAmount) > 0;
+    if (takes.length !== 1 || posted.length) perpRefuse('it does not close with one market order', cmd);
+    const x = fillOf(takes[0]);
+    if (long ? !(x.ask > 0n && x.bid === 0n) : !(x.bid > 0n && x.ask === 0n)) perpRefuse(`it adds to your ${long ? 'long' : 'short'} instead of closing it`, cmd);
+    const want = frac >= 1 ? size : size * frac;
+    if (x.base > want * 1.001 + 1e-12 || x.base < want * 0.999 - (frac >= 1 ? 0 : lot) - 1e-12)
+      perpRefuse(`it closes ${x.base} ${sym}, you asked for ${frac >= 1 ? 'all' : Math.round(frac * 100) + '%'} of ${size}`, cmd);
+  }
 }
 // an Aftermath transaction kind -> the full transaction for the wallet: sender, perpGuard, simulate
 async function finishKind(kindB64: string, addr: string) {
@@ -1580,7 +1724,7 @@ function baseSize(m: any, base: number) {
 // Callers: server.py /api/perp/preview, perp_confirm(); also buildOrder().
 async function preview(addr: string, sym: string, side: number, usd: number, lev: number) {
   const m = await perpMarket(sym);
-  const px: any = await af('markets/prices', { marketIds: [m.objectId] });
+  const px: any = await markPrices(m);
   const mark = Number(px.marketsPrices?.[0]?.markPrice ?? 0);
   if (!(mark > 0)) throw new Error('No price for ' + sym);
   const size = baseSize(m, usd / mark);
@@ -1642,11 +1786,6 @@ function orderPrice(m: any, price: number) {
   const tick = Number(String(m.marketParams.tickSize).replace('n', ''));
   return BigInt(Math.round(price * PX_DEC / tick) * tick);
 }
-async function walletUsdc(addr: string) {
-  const bal: any = await (grpc as any).core.getBalance({ owner: addr, coinType: USDC });
-  const b = bal?.balance ?? bal;
-  return fromBase(b?.balance ?? b?.totalBalance ?? 0);
-}
 // Orders never pull money from the wallet (2026-10-16): they use only the USDC the user deposited into
 // the perps account themselves. Short -> a clear message; the user deposits the amount they choose first.
 async function topUpKind(addr: string, acct: any, amount: number, what = 'order') {
@@ -1699,7 +1838,7 @@ async function buildLimit(addr: string, sym: string, side: number, usd: number, 
 }
 async function buildStop(addr: string, sym: string, side: number, usd: number, lev: number, trigger: number, limit: number) {
   const acct = await needAccount(addr); const m = await perpMarket(sym);
-  const px: any = await af('markets/prices', { marketIds: [m.objectId] });
+  const px: any = await markPrices(m);
   const mark = Number(px.marketsPrices?.[0]?.markPrice ?? 0);
   const size = baseSize(m, usd / (limit || trigger));
   if (size <= 0n) throw new Error('Order too small');
@@ -1730,7 +1869,7 @@ async function buildScale(addr: string, sym: string, side: number, usd: number, 
 }
 async function buildTwap(addr: string, sym: string, side: number, usd: number, lev: number, minutes: number, chunks: number, slip: number) {
   const acct = await needAccount(addr); const m = await perpMarket(sym);
-  const px: any = await af('markets/prices', { marketIds: [m.objectId] });
+  const px: any = await markPrices(m);
   const mark = Number(px.marketsPrices?.[0]?.markPrice ?? 0);
   if (!(chunks >= 2 && chunks <= 100) || !(minutes >= 1 && minutes <= 1440)) throw new Error('TWAP needs 2–100 slices over 1 minute to 24 hours');
   const size = baseSize(m, usd / mark);
@@ -1826,7 +1965,7 @@ async function buildTpSl(addr: string, sym: string, sl: number, tp: number, frac
   if (tp2 > 0 && !(tp > 0 && frac < 1)) throw new Error('A second take-profit needs the first one to close only part of the position');
   const { acct, m, pos } = await openPos(addr, sym);
   const long = Number(pos.baseAssetAmount) > 0;
-  const px: any = await af('markets/prices', { marketIds: [m.objectId] });
+  const px: any = await markPrices(m);
   const mark = Number(px.marketsPrices?.[0]?.indexPrice ?? px.marketsPrices?.[0]?.markPrice ?? 0);
   if (mark > 0) {                                    // the wrong side of the price would trigger at once
     if (sl > 0 && (long ? sl >= mark : sl <= mark)) throw new Error('A stop-loss on a ' + (long ? 'long must be below' : 'short must be above') + ' the price now (' + mark.toPrecision(6) + ')');
@@ -1859,7 +1998,7 @@ async function buildTpSlMulti(addr: string, sym: string, sl: number, tps: [numbe
   if (tps.some((t) => !(t[1] > 0)) || total > 1.0001) throw new Error('The take-profit shares must add up to 100% or less');
   const { acct, m, pos } = await openPos(addr, sym);
   const long = Number(pos.baseAssetAmount) > 0;
-  const px: any = await af('markets/prices', { marketIds: [m.objectId] });
+  const px: any = await markPrices(m);
   const mark = Number(px.marketsPrices?.[0]?.indexPrice ?? px.marketsPrices?.[0]?.markPrice ?? 0);
   if (mark > 0) {
     if (sl > 0 && (long ? sl >= mark : sl <= mark)) throw new Error('A stop-loss on a ' + (long ? 'long must be below' : 'short must be above') + ' the price now (' + mark.toPrecision(6) + ')');
@@ -2048,7 +2187,6 @@ async function lstApys(): Promise<Record<string, number>> {
   _lstApy = { at: Date.now(), v };
   return v;
 }
-const SHOW_VOLO = false;
 // GET /rates-all — one row per (market, coin): yearly %, coin type, decimals. Caller: server.py lend_rates_all().
 // rowsAll() keeps it 5 minutes for coinOf() and positionsAll().
 async function ratesAll() {
@@ -2102,24 +2240,6 @@ async function ratesAll() {
       const sm = SUI_VAULT_MARKETS.find((x) => x.vaultName === v.name); if (!sm) continue;
       rows.push({ market: sm.key, name: v.name.replace('NAVI SUI', 'NAVI'), protocol: 'navi',
                   asset: 'SUI', vault: true, type: SUI_T, dec: 9, total_apr: Number(v.apy?.instant ?? v.apy?.target ?? 0) * 100 });
-    }
-  });
-  // Volo vaults — HIDDEN for now (2026-10-20: "not from volo yet"); flip SHOW_VOLO to list them again.
-  // Volo vaults (NAVI's sister protocol; BTC vaults and outside curators): RATES ONLY — their deposits and withdrawals
-  // are queued for an operator, not settled in the transaction (2026-10-20). Open, unlocked, ≥ $100k only.
-  if (SHOW_VOLO) await settle(async () => {
-    const title = (n: string) => n.toLowerCase().replace(/\b[a-z]/g, (c) => c.toUpperCase()).replace(/\bSui\b/g, 'SUI').replace(/\bLst\b/g, 'LST')
-                                 .replace(/\bNavi\b/g, 'NAVI').replace(/\bXbtc\b/g, 'xBTC').replace(/\bWbtc\b/g, 'WBTC').replace(/#/g, ' #');
-    for (const v of (await vaults()) as any[]) {
-      if (v.source !== 'volo' || v.status !== 'open' || v.lockup || !(Number(v.totalStakedUsd) >= 100_000)) continue;
-      const t = normType(v.assets?.baseCoin?.coinType ?? '');
-      const own = Object.entries(KIVY_COINS).find(([, c]: any) => normType(c.type) === t)?.[0];
-      const tok = own ? undefined : rows.find((r) => r.token && r.type && normType(r.type) === t)?.token;
-      const asset = own ?? (tok ? VARIANT_OF[tok] : undefined);
-      if (!asset) continue;
-      rows.push({ market: 'volo-' + String(v.id).slice(2, 10), name: 'Volo ' + (v.name === 'wBTC' ? 'wBTC' : title(v.name)), protocol: 'volo',
-                  asset, token: tok, type: t, dec: Number(v.assets.baseCoin.decimals), vault: true, rate_only: true,
-                  tvl_usd: Math.round(Number(v.totalStakedUsd)), total_apr: Number(v.apy?.instant ?? v.apy?.target ?? 0) * 100 });
     }
   });
   return rows.filter((r) => Number.isFinite(r.total_apr));
@@ -2202,18 +2322,30 @@ async function staleRetry<T>(f: () => Promise<T>): Promise<T> {
 // ── what a signed transaction really did (for Kivy's after-the-fact check against the plan) ──
 // GET /tx-facts — caller: server.py check_tx() (check 2: the landed transaction against the plan). Read-only.
 async function txFacts(digest: string) {
-  const r: any = await (grpc as any).core.getTransaction({ digest, include: { effects: true, balanceChanges: true, transaction: true } });
+  const r: any = await (grpc as any).core.getTransaction({ digest, include: { effects: true, balanceChanges: true, transaction: true, objectTypes: true } });
   const t = r.Transaction ?? r.FailedTransaction ?? r.transaction ?? r;
-  const st = t.effects?.status ?? t.status ?? {};
+  const st = t.effects?.status ?? t.status;
+  // no status = no effects to compare: an error, so check 2 retries and ends 'unknown' — never green on zero evidence (review K-6)
+  if (typeof st?.success !== 'boolean') throw new Error('the chain reply has no effects for this transaction yet');
   const own = (o: any) => o?.AddressOwner ?? o?.ConsensusAddressOwner?.owner ?? null;
   const sender = t.transaction?.sender ?? null;
   const moved = (t.effects?.changedObjects ?? []).filter((o: any) => own(o.inputOwner) && own(o.outputOwner) && normType(own(o.inputOwner) + '::a::b') !== normType(own(o.outputOwner) + '::a::b'))
     .map((o: any) => ({ object: o.objectId, from: own(o.inputOwner), to: own(o.outputOwner) }));
+  // one of the user's objects that is not a coin leaving the wallet any other way: wrapped, deleted, shared or put under another
+  // object — check 1 refuses these; check 2 now sees them too (review K-9, 2026-10-30)
+  const types: any = r.objectTypes ?? t.objectTypes ?? {};
+  const isMe = (a: any) => !!a && !!sender && normType(a + '::a::b') === normType(sender + '::a::b');
+  const taken = (t.effects?.changedObjects ?? []).filter((o: any) => isMe(own(o.inputOwner)) && !isMe(own(o.outputOwner)) && !own(o.outputOwner)
+      && !/^0x0*2::coin::Coin</.test(String(types[o.objectId] ?? '')))
+    .map((o: any) => ({ object: o.objectId, type: String(types[o.objectId] ?? '') }));
+  const other_cmds = [...new Set((t.transaction?.commands ?? []).map((c: any) => c.$kind ?? Object.keys(c)[0]).filter((k: any) => !['MoveCall', 'SplitCoins', 'MergeCoins', 'TransferObjects', 'MakeMoveVec'].includes(k)))];
+  const gu = t.effects?.gasUsed;                    // the real network fee: check 2 compares SUI before gas, not with a flat 0.1 SUI (K-8)
+  const gas_net = gu ? String(BigInt(gu.computationCost ?? 0) + BigInt(gu.storageCost ?? 0) - BigInt(gu.storageRebate ?? 0)) : null;
   const modules = [...new Set((t.transaction?.commands ?? []).filter((c: any) => c.MoveCall).map((c: any) => c.MoveCall.module + '::' + c.MoveCall.function))];
   const packages = [...new Set((t.transaction?.commands ?? []).filter((c: any) => c.MoveCall).map((c: any) => normType(c.MoveCall.package + '::a::b').split('::')[0]))];
   return { ok: true, success: st.success !== false, error: st.success === false ? JSON.stringify(st.error ?? st).slice(0, 200) : null, sender,
            balance_changes: (t.balanceChanges ?? []).map((b: any) => ({ address: b.address, coin_type: normType(b.coinType), amount: String(b.amount) })),
-           moved, modules, packages,
+           moved, taken, other_cmds, gas_net, modules, packages,
            calls: [...new Set((t.transaction?.commands ?? []).filter((c: any) => c.MoveCall).map((c: any) => normType(c.MoveCall.package + '::a::b').split('::')[0] + '::' + c.MoveCall.module + '::' + c.MoveCall.function))] };
 }
 
@@ -2270,7 +2402,7 @@ async function handle(cmd: string, args: string[]) {
   if (cmd === 'perp-params') {                         // one market's numbers for Kivy's order math (2026-10-23): price, margins, fees
     const sym = args[0] === '0x0' ? args[1] : args[0];   // over HTTP the first argument is always an address slot ('0x0')
     const m: any = await perpMarket(sym); const p = m.marketParams;
-    const px: any = await af('markets/prices', { marketIds: [m.objectId] });
+    const px: any = await markPrices(m);
     return { ok: true, symbol: String(sym).toUpperCase(), mark: Number(px.marketsPrices?.[0]?.markPrice ?? 0), imr: Number(p.marginRatioInitial),
              mmr: Number(p.marginRatioMaintenance), taker: Number(p.takerFee), maker: Number(p.makerFee), min_usd: Number(p.minOrderUsdValue ?? 1),
              max_lev: Math.round(1 / Number(p.marginRatioInitial)) };

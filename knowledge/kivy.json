@@ -2,13 +2,9 @@
  "_about": "Everything Kivy knows and says. The site builds every reply from THIS file plus public market prices, and nothing else — no other project, person or system on this server is visible to it (the owner, 2026-09-30).",
  "name": "Kivy",
  "mode": "wallet-signs",
- "greeting_title": "What can I help with?",
+ "greeting_title": "What should your coins do today?",
+ "greetings": ["What should your coins do today?"],
  "greeting_text": "Tell me a money task in plain words. I'll lay out every step, the cost and the risks. When it's a swap or a transfer, your wallet asks you to approve it — nothing moves without your yes.",
- "suggestions": [
-  "What can Kivy do?",
-  "What assets can Kivy play with?",
-  "Wallet balance"
- ],
  "status_chip": "Every transaction needs your approval",
  "assets": [
   "SUI",
@@ -23,16 +19,16 @@
  "slippage_cap_pct": 0.5,
  "gas_sui": 0.001,
  "venues": {
-  "swap": "Aftermath router (backups: Cetus aggregator, then Bluefin 7k)",
+  "swap": "Aftermath router (backup: Cetus aggregator)",
   "lend": "Suilend or NAVI",
   "withdraw": "Suilend or NAVI"
  },
  "rules": [
   "I plan first: every step, the venue, the cost and the risks, before anything happens",
-  "Every transaction needs your explicit yes in your wallet. A plan of several steps is ONE transaction — one approval, and if any step fails nothing happens (that includes splitting one coin into up to 4 coins, each lent or kept, e.g. \"withdraw haSUI from NAVI, then 25% each into USDC, USDsui, SUI and DEEP, deposit into Suilend\"); a plan across several of your accounts is approved one account at a time, in order",
+  "Every transaction needs your explicit yes in your wallet. A plan of several steps is ONE transaction — one approval, and if any step fails nothing happens (that includes splitting one coin into up to 4 coins, each lent, sent or kept, e.g. \"withdraw haSUI from NAVI, then 25% each into USDC, USDsui, SUI and DEEP, deposit into Suilend\"); a plan across several of your accounts is approved one account at a time, in order",
   "Your wallet signs — I never hold your keys, and connecting only lets me read your address and balances",
   "There is no $ limit on swaps, sends, lending or perps — you approve every transaction in your own wallet",
-  "Only these coins: {assets} — plus the coins Suilend and NAVI list (USDsui, vSUI, haSUI, sSUI, LBTC, wBTC, BLUE, NAVX…); anything unlisted is refused",
+  "Only these coins: {assets} — plus the coins Suilend and NAVI list (USDsui, vSUI, haSUI, sSUI, LBTC, suiWBTC, lzWBTC, BLUE, NAVX…); anything unlisted is refused",
   "Lending is supply only — never borrowing",
   "A swap is refused if slippage would pass {slippage}%",
   "Sending to another address shows the full address first; you approve that one transfer in your wallet"
@@ -107,7 +103,7 @@
     "swap route",
     "best price"
    ],
-   "answer": "Aftermath's router looks across Sui's trading pools and splits a swap to get the best price it can find — I try it first. If its route fails, I build the same swap with the Cetus aggregator, then Bluefin 7k: same coins, same amount, same price protection, still one approval. I show you the quoted amount before anything happens."
+   "answer": "Aftermath's router looks across Sui's trading pools and splits a swap to get the best price it can find — I try it first. If its route fails, I build the same swap with the Cetus aggregator: same coins, same amount, same price protection, still one approval. I show you the quoted amount before anything happens."
   },
   {
    "keys": [
@@ -215,7 +211,6 @@
    "note": "Wormhole SOL — only liquid SOL on Sui; thin above ~$1k"
   }
  },
- "rpc": "https://sui-rpc.publicnode.com",
  "wallet_intro": "Your wallet (read-only):",
  "network": "mainnet",
  "graphql": {
@@ -295,7 +290,8 @@
   }
  },
  "route_blocklist": [
-  "Metastable"
+  "Metastable",
+  "Perpsplexity"
  ],
- "_route_blocklist_about": "Swap-router protocols Kivy never routes through (Aftermath protocolBlacklist). Metastable is winding down (2026-10-25): never route through it or allowlist its packages. Applies to every router: Cetus and Bluefin 7k leave these out too (2026-10-26)."
+ "_route_blocklist_about": "Swap-router protocols Kivy never routes through (Aftermath protocolBlacklist). Metastable is winding down (2026-10-25): never route through it or allowlist its packages. Applies to every router: Cetus leaves these out too (2026-10-26)."
 }

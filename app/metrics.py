@@ -28,7 +28,6 @@ from pathlib import Path
 DATA = Path(__file__).resolve().parent / 'data'
 DB = DATA / 'metrics.db'
 _lock = threading.RLock()   # re-entrant: export_rows('daily') calls summary() while holding it — a plain Lock froze every stats request (2026-10-23)
-_local = threading.local()
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS visits   (day TEXT, vid TEXT, n INTEGER DEFAULT 1, PRIMARY KEY (day, vid));
@@ -51,14 +50,20 @@ CREATE INDEX IF NOT EXISTS ptb_day ON ptbs(day);
 CREATE INDEX IF NOT EXISTS fail_day ON failures(day, kind);
 """
 
+NEW_VISITORS_DAY = 20000    # new visitor ids per day, all browsers (review K-12: a flood of fresh ids can't inflate the numbers)
+NEW_WALLETS_DAY = 5000      # new wallets per day
 EVENTS = {'visit', 'connect', 'card', 'approve', 'reject', 'signed', 'tx_failed', 'terminal', 'market', 'wallet_panel', 'feature', 'msg'}
 SERVICES = ('swap', 'send', 'lend', 'withdraw', 'claim', 'perps_open', 'perps_close', 'perps_deposit', 'perps_withdraw',
             'perps_margin', 'perps_tpsl', 'perps_cancel', 'perps_account')
 
 
-# This thread's SQLite connection (WAL mode, so readers don't block the site); creates the tables and adds later columns.
+# One shared SQLite connection (WAL mode; every use holds _lock), opened once: a connection per request thread cost ~0.5 ms
+# each (review 2026-11-04 W-6). Creates the tables and adds later columns.
+_CONN = {}
+
+
 def _db():
-    c = getattr(_local, 'c', None)
+    c = _CONN.get('c')
     if c is None:
         DATA.mkdir(exist_ok=True)
         c = sqlite3.connect(str(DB), timeout=10, check_same_thread=False)
@@ -69,7 +74,7 @@ def _db():
                 c.execute('ALTER TABLE ' + col)
             except sqlite3.OperationalError:
                 pass
-        _local.c = c
+        _CONN['c'] = c
     return c
 
 
@@ -116,6 +121,9 @@ def visit(vid):
     d = day()
     with _lock:
         c = _db()
+        if not c.execute('SELECT 1 FROM visitors WHERE vid = ?', (vid,)).fetchone() \
+                and c.execute('SELECT COUNT(*) FROM visitors WHERE first_day = ?', (d,)).fetchone()[0] >= NEW_VISITORS_DAY:
+            return                                       # a known visitor still counts; a flood of new ids doesn't
         c.execute('INSERT INTO visits(day, vid) VALUES(?,?) ON CONFLICT(day, vid) DO UPDATE SET n = n + 1', (d, vid))
         c.execute('INSERT INTO visitors(vid, first_day, last_day) VALUES(?,?,?) ON CONFLICT(vid) DO UPDATE SET last_day = ?', (vid, d, d, d))
         c.commit()
@@ -129,6 +137,9 @@ def wallet_seen(address, d=None, vid=None):
     v = vid if VID_RE.match(str(vid or '')) else None
     with _lock:
         c = _db()
+        if not c.execute('SELECT 1 FROM wallets WHERE wh = ?', (h,)).fetchone() \
+                and c.execute('SELECT COUNT(*) FROM wallets WHERE first_day = ?', (d,)).fetchone()[0] >= NEW_WALLETS_DAY:
+            return                                       # a known wallet still counts; a flood of new addresses doesn't
         c.execute('INSERT INTO wallets(wh, first_day, last_day, first_vid) VALUES(?,?,?,?) ON CONFLICT(wh) DO UPDATE SET '
                   'first_day = MIN(first_day, excluded.first_day), last_day = MAX(last_day, excluded.last_day), '
                   'first_vid = COALESCE(first_vid, excluded.first_vid)', (h, d, d, v))
@@ -208,6 +219,14 @@ def feedback_md():
     tmp = FEEDBACK_MD.with_suffix('.tmp')
     tmp.write_text('\n'.join(out) + '\n')
     tmp.replace(FEEDBACK_MD)
+
+
+def had_kivy_tx(address):
+    """True when this wallet already has a transaction through Kivy that check 2 verified (review W2-2)."""
+    if not re.match(r'^0x[0-9a-f]{64}$', str(address or '').lower()):
+        return False
+    with _lock:
+        return bool(_db().execute('SELECT 1 FROM ptbs WHERE wh = ? AND verified = 1 LIMIT 1', (wh(address),)).fetchone())
 
 
 def ptb(digest, address, status, kind, actions, verified, source='live', ts=None, gas=0.0, fee=0.0):

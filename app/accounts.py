@@ -5,7 +5,7 @@ personal-message signature, not a transaction), and we check the signature belon
 the claimed address before handing out a signed cookie. Each address's chats live in
 their own file, named by a hash of the address; the server only ever opens the file
 for the address inside a valid cookie, so nobody can read anyone else's chats.
-(Google/zkLogin sign-in was removed the same day; verify_google is kept unused.)
+(Google/zkLogin sign-in was removed the same day.)
 """
 # How it runs: imported by site/server.py inside the kivy-site service (:8772); nothing here runs on its own.
 # Routes in server.py that use it: /api/auth/challenge (challenge), /api/auth/wallet (sign_in_wallet, record_sign_in,
@@ -17,6 +17,7 @@ for the address inside a valid cookie, so nobody can read anyone else's chats.
 # customers.db (sign-ins + signed Terms), the terms_on switch file, and two private keys (cookie signing, chat encryption)
 # created on first use. walrus/export_records.py reads customers.db to save each signed agreement to Walrus.
 import base64
+import contextlib
 import hashlib
 import hmac
 import json
@@ -31,18 +32,16 @@ from pathlib import Path
 
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from cryptography.hazmat.primitives.asymmetric import ec, ed25519, padding, rsa, utils as ec_utils
+from cryptography.hazmat.primitives.asymmetric import ec, ed25519, utils as ec_utils
 
 HOME = Path(__file__).resolve().parent
 DATA = HOME / 'data'
 CHATS = DATA / 'chats'
 USER_COOKIE, USER_TTL = 'kivy_user', 7 * 24 * 3600
+LOGIN_COOKIE = 'kivy_login'                          # the browser that asked for a sign-in challenge (review W2-1)
 MAX_CHATS, MAX_TURNS, MAX_CHAT_BYTES = 40, 200, 150_000
-ISSUERS = ('accounts.google.com', 'https://accounts.google.com')
-CERTS = 'https://www.googleapis.com/oauth2/v3/certs'
 ID_RE = re.compile(r'^[A-Za-z0-9_-]{1,40}$')
 _lock = threading.Lock()
-_jwks = {'at': 0, 'keys': {}}
 LOGOUTS = DATA / 'logouts.json'   # email -> time of the last Log out: every login pass issued before it stops working (red-team low #2)
 _logouts = None
 
@@ -57,54 +56,6 @@ def _key():
 # base64url decode that tolerates missing '=' padding (cookies, JWT parts).
 def _b64d(s):
     return base64.urlsafe_b64decode(s + '=' * (-len(s) % 4))
-
-
-# Google sign-in leftovers (unused since wallet sign-in): the client id, Google's public keys, verify_google.
-def _client_id():
-    try:
-        return json.load(open(HOME / 'zklogin.json')).get('google_client_id') or ''
-    except Exception:
-        return ''
-
-
-def _google_key(kid):
-    if kid not in _jwks['keys'] or time.time() - _jwks['at'] > 3600:
-        with urllib.request.urlopen(CERTS, timeout=10) as r:
-            keys = json.load(r)['keys']
-        _jwks['keys'] = {k['kid']: rsa.RSAPublicNumbers(int.from_bytes(_b64d(k['e']), 'big'),
-                                                        int.from_bytes(_b64d(k['n']), 'big')).public_key()
-                         for k in keys if k.get('kty') == 'RSA'}
-        _jwks['at'] = time.time()
-    return _jwks['keys'].get(kid)
-
-
-def verify_google(jwt):
-    """Return the verified, lower-cased email in a Google ID token, or raise ValueError."""
-    try:
-        h, p, s = jwt.split('.')
-        head, claims = json.loads(_b64d(h)), json.loads(_b64d(p))
-    except Exception:
-        raise ValueError('bad token')
-    if head.get('alg') != 'RS256':
-        raise ValueError('bad alg')
-    key = _google_key(head.get('kid'))
-    if not key:
-        raise ValueError('unknown key')
-    try:
-        key.verify(_b64d(s), (h + '.' + p).encode(), padding.PKCS1v15(), hashes.SHA256())
-    except Exception:
-        raise ValueError('bad signature')
-    now = time.time()
-    if claims.get('iss') not in ISSUERS:
-        raise ValueError('bad issuer')
-    if not _client_id() or claims.get('aud') != _client_id():
-        raise ValueError('bad audience')
-    if not (float(claims.get('exp', 0)) > now - 60 and float(claims.get('iat', 0)) < now + 300):
-        raise ValueError('expired')
-    email = str(claims.get('email') or '').strip().lower()
-    if not email or claims.get('email_verified') not in (True, 'true'):
-        raise ValueError('no verified email')
-    return email
 
 
 # The sign-in cookie: base64(account) . expiry . HMAC-SHA256 with the server's private cookie key. Set by /api/auth/wallet.
@@ -138,6 +89,15 @@ def log_out_everywhere(email):
 
 # The signed-in account for a request's Cookie header, or None (bad signature, expired, or issued before a logout).
 # Called by server.py on every /api/me, /api/chats*, /api/terms and logout request.
+def login_from_cookie(header):
+    """The sign-in binding token /api/auth/challenge set in this browser, or None."""
+    for part in (header or '').split(';'):
+        k, _, v = part.strip().partition('=')
+        if k == LOGIN_COOKIE and re.fullmatch(r'[A-Za-z0-9_-]{16,64}', v):
+            return v
+    return None
+
+
 def email_from_cookie(header):
     for part in (header or '').split(';'):
         k, _, v = part.strip().partition('=')
@@ -249,10 +209,13 @@ def save_chat(email, chat, index=None):
     if not _file(email).exists() and not _room_for_new():
         raise ValueError('chat storage is full right now')
     with _lock:
-        chats = [x for x in list_chats(email) if x.get('id') != c['id']]
+        old = list_chats(email)
+        chats = [x for x in old if x.get('id') != c['id']]
         chats.insert(max(0, min(len(chats), index)) if isinstance(index, int) else 0, c)
         while len(chats) > 1 and len(json.dumps(chats)) > 2_000_000:   # one account keeps at most ~2 MB: the oldest chats go first (review F-10)
             chats.pop()
+        if not _room_for_new() and len(json.dumps(chats)) > len(json.dumps(old)):   # full: a history may shrink, never grow (review W2-7)
+            raise ValueError('chat storage is full right now')
         _write(email, chats)
 
 
@@ -265,13 +228,16 @@ def delete_chat(email, cid):
 # ── wallet sign-in ──
 ADDR = re.compile(r'^0x[0-9a-f]{64}$')
 GRAPHQL = 'https://graphql.mainnet.sui.io/graphql'
-_pending = {}            # nonce -> (address, message, expires)
+_pending = {}            # nonce -> (address, message, expires, visitor ip or None)
+_plock = threading.Lock()  # guards _pending: concurrent sign-ins crashed iterating it (review 2026-11-04 S-2)
+PENDING_PER_IP = 20      # open sign-ins one visitor address may hold at once (W-6)
 
 # Terms of Service (2026-10-24): the sign-in message doubles as the agreement, so the user signs once. Switched on by
 # the file data/terms_on (after the owner approves the text); each signed agreement is kept in data/customers.db with the
 # wallet address, time, exact message and signature, and saved to the wallet's Walrus space by projects/kivy/walrus.
 TERMS_VERSION = 'v1'
 TERMS_URL = 'https://kivy.kivelabs.xyz/terms'
+SITE_HOST = 'kivy.kivelabs.xyz'                     # named in every sign-in message, so a signature asked for on another site reads wrong (review W3-8)
 CUSTOMERS = DATA / 'customers.db'
 
 
@@ -281,12 +247,24 @@ def terms_on():
 
 
 # customers.db, created on first use: customers (one row per wallet that signed in) and agreements (each signed Terms).
+_CDB_READY = []
+
+
+# The customers database: tables made once per process (not 3 statements per call), committed and CLOSED after each use
+# (a bare `with sqlite3.connect()` commits but leaves the connection open — W-2, 2026-11-07).
+@contextlib.contextmanager
 def _cdb():
     c = sqlite3.connect(CUSTOMERS, timeout=10)
-    c.execute('CREATE TABLE IF NOT EXISTS customers (address TEXT PRIMARY KEY, first_seen REAL, last_seen REAL, sign_ins INTEGER)')
-    c.execute('CREATE TABLE IF NOT EXISTS agreements (id INTEGER PRIMARY KEY, address TEXT, version TEXT, ts REAL, message TEXT, signature TEXT)')
-    c.execute('CREATE INDEX IF NOT EXISTS agreements_addr ON agreements(address)')
-    return c
+    try:
+        if not _CDB_READY:
+            c.executescript('CREATE TABLE IF NOT EXISTS customers (address TEXT PRIMARY KEY, first_seen REAL, last_seen REAL, sign_ins INTEGER);'
+                            'CREATE TABLE IF NOT EXISTS agreements (id INTEGER PRIMARY KEY, address TEXT, version TEXT, ts REAL, message TEXT, signature TEXT);'
+                            'CREATE INDEX IF NOT EXISTS agreements_addr ON agreements(address);')
+            _CDB_READY.append(True)
+        with c:
+            yield c
+    finally:
+        c.close()
 
 
 def record_sign_in(address, message, signature):
@@ -313,28 +291,37 @@ def agreed(address):
 
 # /api/auth/challenge: a one-time message for the wallet to sign (valid 10 minutes, kept in memory only, so a
 # kivy-site restart cancels open sign-ins). It includes the Terms when they are switched on.
-def challenge(address):
+def challenge(address, ip=None, bind=None):
     address = str(address or '').lower()
     if not ADDR.match(address):
         raise ValueError('bad address')
-    now = time.time()
-    for k in [k for k, v in _pending.items() if v[2] < now]:
-        _pending.pop(k, None)
-    mine = sorted((v[2], k) for k, v in _pending.items() if v[0] == address)
-    for _, k in mine[:max(0, len(mine) - 4)]:          # at most 5 open sign-ins per address: the newest win (audit V12)
-        _pending.pop(k, None)
-    if len(_pending) >= 5000:                           # a burst of many addresses: refuse until some expire
-        raise ValueError('busy, try again in a minute')
+    with _plock:
+        now = time.time()
+        for k in [k for k, v in _pending.items() if v[2] < now]:
+            _pending.pop(k, None)
+        src = lambda v: v[3] if len(v) > 3 else None
+        mine = sorted((v[2], k) for k, v in _pending.items() if v[0] == address and src(v) == ip)
+        for _, k in mine[:max(0, len(mine) - 4)]:          # at most 5 open sign-ins per address FROM THIS VISITOR: the newest win (audit V12);
+            _pending.pop(k, None)                           # another IP can no longer push out the owner's open sign-in (W-6)
+        if ip and sum(1 for v in _pending.values() if src(v) == ip) >= PENDING_PER_IP:
+            raise ValueError('busy, try again in a minute')   # one visitor can't fill the shared list (W-6)
+        if len(_pending) >= 5000:                           # full: the visitor holding the most open sign-ins loses their oldest one — refusing
+            held = {}                                       # let ~250 networks lock everyone out of signing in (review K-13, 2026-10-30)
+            for v in _pending.values():
+                held[src(v)] = held.get(src(v), 0) + 1
+            top = max(held, key=held.get)
+            _pending.pop(min((v[2], k) for k, v in _pending.items() if src(v) == top)[1], None)
     nonce = secrets.token_hex(12)
     if terms_on():
         msg = ("Sign in to Kivy\n\nI agree to Kivy's Terms of Service (%s) and Privacy Policy: %s\n\n"
-               'This proves you own this wallet. It is not a transaction and costs nothing.\n\nAddress: %s\nNonce: %s\nIssued: %s UTC'
-               % (TERMS_VERSION, TERMS_URL, address, nonce, time.strftime('%Y-%m-%d %H:%M', time.gmtime(now))))
+               'This proves you own this wallet. It is not a transaction and costs nothing.\n\nSite: %s (do not sign this anywhere else)\nAddress: %s\nNonce: %s\nIssued: %s UTC'
+               % (TERMS_VERSION, TERMS_URL, SITE_HOST, address, nonce, time.strftime('%Y-%m-%d %H:%M', time.gmtime(now))))
     else:
         msg = ('Sign in to Kivy\n\nThis only proves you own this wallet so your chats stay private. '
-               'It is not a transaction and costs nothing.\n\nAddress: %s\nNonce: %s\nIssued: %s UTC'
-               % (address, nonce, time.strftime('%Y-%m-%d %H:%M', time.gmtime(now))))
-    _pending[nonce] = (address, msg, now + 600)
+               'It is not a transaction and costs nothing.\n\nSite: %s (do not sign this anywhere else)\nAddress: %s\nNonce: %s\nIssued: %s UTC'
+               % (SITE_HOST, address, nonce, time.strftime('%Y-%m-%d %H:%M', time.gmtime(now))))
+    with _plock:
+        _pending[nonce] = (address, msg, now + 600, ip, hashlib.sha256(bind.encode()).hexdigest() if bind else None)
     return msg
 
 
@@ -384,13 +371,17 @@ def verify_personal(address, msg_bytes, sig_b64):
 
 # /api/auth/wallet: the nonce must be one challenge() issued for this address, unused and unexpired; then the signature
 # must verify. server.py then sets the cookie and (Terms on) calls record_sign_in.
-def sign_in_wallet(address, message, sig_b64):
+def sign_in_wallet(address, message, sig_b64, bind=None):
     """Return the address when the one-time message was signed by it, else raise ValueError."""
     address = str(address or '').lower()
     m = re.search(r'Nonce: ([0-9a-f]{24})', str(message or ''))
-    hit = _pending.pop(m.group(1), None) if m else None
+    with _plock:
+        hit = _pending.pop(m.group(1), None) if m else None
     if not hit or hit[0] != address or hit[1] != message or hit[2] < time.time():
         raise ValueError('sign-in expired, try again')
+    want = hit[4] if len(hit) > 4 else None            # a reviewer W2-1: a challenge bound to a browser only signs in that browser
+    if want and not hmac.compare_digest(want, hashlib.sha256(str(bind or '').encode()).hexdigest()):
+        raise ValueError('start the sign-in again in this browser')
     if not verify_personal(address, message.encode(), str(sig_b64 or '')):
         raise ValueError('signature does not match this wallet')
     return address
