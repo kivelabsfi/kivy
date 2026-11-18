@@ -27,12 +27,12 @@ TOOLS = [{'functionDeclarations': [
                     'description': 'Coin symbols, e.g. ["SUI","DEEP"]. Empty for all.'}}}},
     {'name': 'plan_swap', 'description': 'Build a swap PLAN (nothing is executed).',
      'parameters': {'type': 'OBJECT', 'properties': {
-         'amount': {'type': 'STRING', 'description': 'a number, or all / max / half of what the wallet holds'}, 'from_asset': {'type': 'STRING'}, 'to_asset': {'type': 'STRING'}},
-         'required': ['amount', 'from_asset', 'to_asset']}},
+         'amount': {'type': 'STRING', 'description': 'the number the user typed, or all / max / half; leave EMPTY when they gave no amount (the swap card lets them pick)'}, 'from_asset': {'type': 'STRING'}, 'to_asset': {'type': 'STRING'}},
+         'required': ['from_asset', 'to_asset']}},
     {'name': 'plan_lend', 'description': 'Lend (supply) any coin Suilend or NAVI lists — USDC, SUI, BTC, WAL, DEEP, ETH, SOL, and versions like vSUI, sSUI, LBTC, USDsui. USDC gets a plan; other coins open a lending card, and if the user has none of that coin the card swaps another coin into it and lends it in ONE transaction. The user signs it.',
-     'parameters': {'type': 'OBJECT', 'properties': {'amount': {'type': 'STRING', 'description': 'a number, or all / max / half of what the wallet holds'}, 'asset': {'type': 'STRING'},
+     'parameters': {'type': 'OBJECT', 'properties': {'amount': {'type': 'STRING', 'description': 'the number the user typed, or all / max / half; leave EMPTY when they gave no amount (the card opens with a slider)'}, 'asset': {'type': 'STRING'},
                     'protocol': {'type': 'STRING', 'description': 'suilend or navi; leave empty for the higher rate'}},
-                    'required': ['amount', 'asset']}},
+                    'required': ['asset']}},
     {'name': 'plan_send', 'description': 'Build a PLAN to send a coin to another address or .sui name (nothing is executed; the user approves in their wallet).',
      'parameters': {'type': 'OBJECT', 'properties': {'amount': {'type': 'STRING', 'description': 'a number, or all / max / half of what the wallet holds'}, 'asset': {'type': 'STRING'},
                     'recipient': {'type': 'STRING', 'description': 'Full 0x address or a .sui name'}},
@@ -50,14 +50,14 @@ TOOLS = [{'functionDeclarations': [
                     'margin': {'type': 'STRING', 'description': "trade: USDC the user puts in, or 'max' for all their free USDC (Kivy sizes the biggest order it allows)"},
                     'order_type': {'type': 'STRING', 'description': 'trade: market or limit'},
                     'price': {'type': 'STRING', 'description': 'trade: limit price, if a limit order'},
-                    'leverage': {'type': 'STRING', 'description': "trade: a number or 'max' (market's maximum)"},
+                    'leverage': {'type': 'STRING', 'description': "trade: ONLY a leverage the user said — a number, or 'max' when they said max leverage. Leave EMPTY otherwise: never choose one"},
                     'symbol': {'type': 'STRING', 'description': 'market symbol for chart, e.g. BTC, ETH, SOL, GOLD'}}, 'required': ['card']}},
     {'name': 'get_transaction', 'description': 'Read a finished transaction from the Sui chain: what was sent, from whom, to whom, the fee and the time. Leave digest empty to use the last transaction in this chat.',
      'parameters': {'type': 'OBJECT', 'properties': {'digest': {'type': 'STRING', 'description': 'transaction id (digest); optional'}}}},
     {'name': 'plan_withdraw', 'description': 'Build a PLAN to withdraw lent USDC back to the wallet; the user signs it.',
-     'parameters': {'type': 'OBJECT', 'properties': {'amount': {'type': 'STRING', 'description': 'a number, or all'}, 'asset': {'type': 'STRING'},
-                    'protocol': {'type': 'STRING', 'description': 'suilend or navi; leave empty for where the user has funds'}},
-                    'required': ['amount', 'asset']}},
+     'parameters': {'type': 'OBJECT', 'properties': {'amount': {'type': 'STRING', 'description': 'the number the user typed, or all; leave EMPTY when they gave no amount (the card opens with a slider)'}, 'asset': {'type': 'STRING'},
+                    'protocol': {'type': 'STRING', 'description': 'the market the USER named (suilend, ember, navi…); leave EMPTY when they named none — with several markets Kivy shows the which-market choices; never choose one yourself'}},
+                    'required': ['asset']}},
     {'name': 'get_lending', 'description': 'Live lending rates on Suilend and NAVI for ANY coin (USDC, USDsui, SUI, sSUI, vSUI, BTC, WAL…), the collateral each market accepts (its risk), and every coin the user has lent and where. Pass asset to get that coin\'s markets; leave it empty for USDC.',
      'parameters': {'type': 'OBJECT', 'properties': {'asset': {'type': 'STRING', 'description': 'The coin, e.g. USDsui, SUI, sSUI. Empty = USDC.'}}}},
     {'name': 'get_quote', 'description': "The swap router's live quote (nothing is built or signed): what an amount of one coin gets in another. Use for any 'how much X would I get', 'what is N worth in Y' question.",
@@ -79,10 +79,17 @@ def _leak_re():
     publishing the code doesn't publish them. Without the file, the generic patterns still apply."""
     words = []
     try:
-        words = [w.strip() for w in open(os.environ.get('KIVY_LEAK_FILE', '/opt/kivy/data/leak_words.txt')) if w.strip() and not w.startswith('#')]
+        # the data folder's list, else the live default (a test run with its own temp data folder kept no words — 2026-11-15)
+        for f in [os.environ.get('KIVY_LEAK_FILE'), os.path.join(os.environ.get('KIVY_DATA') or '/opt/kivy/data', 'leak_words.txt'),
+                  '/opt/kivy/data/leak_words.txt']:
+            if f and os.path.isfile(f):
+                words = [w.strip() for w in open(f) if w.strip() and not w.startswith('#')]
+                break
     except OSError:
         pass
-    return re.compile(r'\b(' + '|'.join(words + [r'/root', r'/opt', r'secrets?/']) + r')\b|suiprivkey', re.I)
+    # paths match after a space too ("files are in /srv/…" slipped through: \b before '/' needs a word character — scan F9)
+    gen = r'(?<![\w/.-])/(?:root|opt)(?:/|\b)|\bsecrets?/|suiprivkey'
+    return re.compile((r'\b(' + '|'.join(words) + r')\b|' if words else '') + gen, re.I)
 
 
 LEAK = _leak_re()

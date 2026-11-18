@@ -17,12 +17,14 @@ if [ "$1" = "--dry" ]; then
   out=$(python3 export_records.py 2>&1) || { echo "DRY export failed: $(echo "$out" | tail -3)"; exit 1; }
   echo "DRY user=$(id -un) node=$(command -v node) $(node --version)"
   echo "DRY new records: $(echo "$out" | python3 -c 'import json,sys;r=json.load(sys.stdin);print(len(r), [x["key"] for x in r][:10])')"
-  test -r /opt/kivy/data/memwal.key && echo "DRY memwal.key readable" || echo "DRY memwal.key NOT readable"
+  { test -r "${CREDENTIALS_DIRECTORY:-/nonexistent}/memwal.key" || test -r /opt/kivy/keys/memwal.key || test -r /opt/kivy/data/memwal.key; } && echo "DRY memwal.key readable" || echo "DRY memwal.key NOT readable"
   node -e "import('@mysten-incubation/memwal').then(m => console.log('DRY memwal module loads:', typeof m.MemWal))" 2>&1 | tail -1
-  for f in ledger.jsonl senders.json .status.json run.log; do test -w $f && echo "DRY $f writable" || echo "DRY $f NOT writable"; done
+  for f in ledger.jsonl senders.json .status.json run.log spaces.jsonl; do test -w $f && echo "DRY $f writable" || echo "DRY $f NOT writable"; done
   exit 0
 fi
-out=$(python3 export_records.py 2>&1) || { echo "{\"ok\":false,\"at\":\"$(date -u +%FT%TZ)\",\"err\":\"export failed\"}" > .status.json; echo "$out" | tail -3 >> run.log; exit 1; }
+# --state: read only what is new since the last run (export_records.py docstring); without a writable export_state.db (the
+# sandbox must bind it, as ledger.jsonl) the export does the full read by itself, so this line is safe either way
+out=$(python3 export_records.py --state export_state.db 2>&1) || { echo "{\"ok\":false,\"at\":\"$(date -u +%FT%TZ)\",\"err\":\"export failed\"}" > .status.json; echo "$out" | tail -3 >> run.log; exit 1; }
 n=$(echo "$out" | python3 -c 'import json,sys;print(len(json.load(sys.stdin)))')
 # nothing new: report ok and stop
 if [ "$n" = "0" ]; then echo "{\"ok\":true,\"at\":\"$(date -u +%FT%TZ)\",\"saved\":0}" > .status.json; exit 0; fi

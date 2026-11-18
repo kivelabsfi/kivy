@@ -14,6 +14,7 @@ SQLite in /opt/kivy/data (the service's only writable folder)."""
 # also calls /internal/metrics. tools/feedback_weekly.py and stats_weekly.py read metrics.db read-only;
 # tools/metrics_backfill.py (ptb) and tools/pipeline_backfill.py (pipe) import this module for one-off backfills.
 # Output files: metrics.db (tables in SCHEMA) and feedback.md (a readable feedback log) in the data folder.
+import contextlib
 import hashlib
 import hmac
 import json
@@ -25,9 +26,9 @@ import threading
 import time
 from pathlib import Path
 
-DATA = Path(__file__).resolve().parent / 'data'
+from kivy.settings import DATA                      # noqa: E402  KIVY_DATA (2026-11-14)
 DB = DATA / 'metrics.db'
-_lock = threading.RLock()   # re-entrant: export_rows('daily') calls summary() while holding it — a plain Lock froze every stats request (2026-10-23)
+_lock = threading.RLock()   # re-entrant (export_rows('daily') once called summary() while holding it and a plain Lock froze every stats request, 2026-10-23)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS visits   (day TEXT, vid TEXT, n INTEGER DEFAULT 1, PRIMARY KEY (day, vid));
@@ -48,7 +49,15 @@ CREATE TABLE IF NOT EXISTS pipeline (iid TEXT PRIMARY KEY, ts REAL, day TEXT, wh
 CREATE INDEX IF NOT EXISTS ev_day ON events(day, name);
 CREATE INDEX IF NOT EXISTS ptb_day ON ptbs(day);
 CREATE INDEX IF NOT EXISTS fail_day ON failures(day, kind);
+CREATE INDEX IF NOT EXISTS ev_day_vid ON events(day, vid);
+CREATE INDEX IF NOT EXISTS vis_first ON visitors(first_day);
+CREATE INDEX IF NOT EXISTS wal_first ON wallets(first_day);
+CREATE INDEX IF NOT EXISTS fb_day_vid ON feedback(day, vid);
+CREATE INDEX IF NOT EXISTS pipe_day_wh ON pipeline(day, wh);
 """
+# The last four indexes (fix package 2, a reviewer scan 2026-11-15 S4): the per-browser, new-visitor, new-wallet and feedback caps
+# counted with no fitting index — every row of the day walked, under the stats lock, on every event (10 ms at 20,000 events a
+# day, 100-180 ms at 200,000). IF NOT EXISTS: built once on the existing file at the first connection, then kept up by SQLite.
 
 NEW_VISITORS_DAY = 20000    # new visitor ids per day, all browsers (review K-12: a flood of fresh ids can't inflate the numbers)
 NEW_WALLETS_DAY = 5000      # new wallets per day
@@ -58,8 +67,10 @@ SERVICES = ('swap', 'send', 'lend', 'withdraw', 'claim', 'perps_open', 'perps_cl
 
 
 # One shared SQLite connection (WAL mode; every use holds _lock), opened once: a connection per request thread cost ~0.5 ms
-# each (review 2026-11-04 W-6). Creates the tables and adds later columns.
+# each (review 2026-11-04 W-6). Creates the tables and adds later columns. The dashboard's reads use a second, read-only
+# connection (_reading) so they never hold _lock; both live in _CONN, so tests that point DB elsewhere clear them together.
 _CONN = {}
+_rlock = threading.RLock()  # the read connection's own lock: two dashboard views take turns, chats never wait for either
 
 
 def _db():
@@ -76,6 +87,41 @@ def _db():
                 pass
         _CONN['c'] = c
     return c
+
+
+# The read-only connection behind summary(), the exports and feedback.md (review scan 2026-11-15 S7: summary's ~40 queries held
+# _lock, so every chat's event() waited for the dashboard). WAL lets it read while _db() writes. One read transaction per outer
+# call, so every number of one summary still comes from the same moment, as it did under the lock.
+@contextlib.contextmanager
+def _reading():
+    with _rlock:
+        c = _CONN.get('r')
+        if c is None:
+            with _lock:
+                _db()                                    # the file, its tables and WAL mode exist before a read-only open
+            c = sqlite3.connect(Path(DB).absolute().as_uri() + '?mode=ro', uri=True, timeout=10, check_same_thread=False,
+                                isolation_level=None)
+            _CONN['r'] = c
+        own = not c.in_transaction
+        if own:
+            c.execute('BEGIN')
+        try:
+            yield c
+        finally:
+            if own:
+                try:
+                    c.execute('ROLLBACK')
+                except sqlite3.Error:
+                    _CONN.pop('r', None)                 # a broken read connection is opened again next time
+
+
+# The day's event count for the 300,000 cap: counted once a day (and once per connection), then kept here and raised by each
+# insert, instead of a COUNT over the whole day on every event (S4). Lives in _CONN so it resets with the connection.
+def _events_today(c, d):
+    k = _CONN.get('evday')
+    if not k or k[0] != d:
+        k = _CONN['evday'] = [d, c.execute('SELECT COUNT(*) FROM events WHERE day = ?', (d,)).fetchone()[0]]
+    return k
 
 
 # The private salt behind wh(), created once in the data folder (never leaves the box, not in backups).
@@ -103,11 +149,14 @@ def day(ts=None):
 
 
 VID_RE = re.compile(r'^[0-9a-f]{16,32}$')
+REDACT_MARGIN = 200      # characters read past n: a full address (66), a .sui name (67) or a 12-word phrase fits
 
 
 def redact(text, n=300):
-    """Free text for the failure log: addresses, .sui names and long numbers blanked; capped."""
-    t = re.sub(r'0x[0-9a-fA-F]{6,}', '0x…', str(text or ''))
+    """Free text for the failure log: addresses, .sui names and long numbers blanked; capped. Cut FIRST, to n plus a margin so
+    a name, address or phrase across the cut is still blanked, then blanked, then cut to n (review scan 2026-11-15 S1: the
+    patterns ran on a whole 24 kB field — 23 kB of "a-" took 2.2 s, inside the stats lock)."""
+    t = re.sub(r'0x[0-9a-fA-F]{6,}', '0x…', str(text or '')[:n + REDACT_MARGIN])
     t = re.sub(r'\b[\w-]+\.sui\b', 'name.sui', t)
     t = re.sub(r'@\w{2,}', '@name', t)
     t = re.sub(r'\b[a-z]{3,}(\s+[a-z]{3,}){11,}\b', '[words removed]', t, flags=re.I)   # a pasted seed phrase never lands here
@@ -151,23 +200,27 @@ def wallet_seen(address, d=None, vid=None):
 def event(vid, name, detail=''):
     if name not in EVENTS or not VID_RE.match(str(vid or '')):
         return
+    detail, d = redact(detail, 80), day()               # the patterns run before the lock is taken (S1)
     with _lock:
         c = _db()
-        if c.execute('SELECT COUNT(*) FROM events WHERE day = ? AND vid = ?', (day(), vid)).fetchone()[0] > 2000 \
-                or c.execute('SELECT COUNT(*) FROM events WHERE day = ?', (day(),)).fetchone()[0] > 300000:
+        k = _events_today(c, d)
+        if c.execute('SELECT COUNT(*) FROM events WHERE day = ? AND vid = ?', (d, vid)).fetchone()[0] > 2000 \
+                or k[1] > 300000:
             return                                       # one browser (or a flood of new ids) can't fill the table
-        c.execute('INSERT INTO events(ts, day, vid, name, detail) VALUES(?,?,?,?,?)', (time.time(), day(), vid, name, redact(detail, 80)))
+        c.execute('INSERT INTO events(ts, day, vid, name, detail) VALUES(?,?,?,?,?)', (time.time(), d, vid, name, detail))
         c.commit()
+        k[1] += 1
 
 
 # Where Kivy struggled (a question it could not route, a refused request, a failed build), redacted and capped per day.
 def failure(kind, text, detail='', vid=''):
+    text, detail = redact(text), redact(detail, 200)     # before the lock (S1)
     with _lock:
         c = _db()
         if c.execute('SELECT COUNT(*) FROM failures WHERE day = ?', (day(),)).fetchone()[0] > 20000:
             return
         c.execute('INSERT INTO failures(ts, day, kind, text, detail, vid) VALUES(?,?,?,?,?,?)',
-                  (time.time(), day(), kind[:30], redact(text), redact(detail, 200), vid if VID_RE.match(str(vid or '')) else ''))
+                  (time.time(), day(), kind[:30], text, detail, vid if VID_RE.match(str(vid or '')) else ''))
         c.commit()
 
 
@@ -177,13 +230,14 @@ def feedback(vid, rating, note, ask, answer):
         return False
     if rating == 0 and not str(note or '').strip():
         return False
+    note, ask, answer = redact(note, 500), redact(ask), redact(answer, 400)   # before the lock (S1)
     with _lock:
         c = _db()
         if c.execute('SELECT COUNT(*) FROM feedback WHERE day = ? AND vid = ?', (day(), vid)).fetchone()[0] > 200 \
                 or c.execute('SELECT COUNT(*) FROM feedback WHERE day = ?', (day(),)).fetchone()[0] > 5000:   # all visitors: a flood can't fill the disk
             return False
         c.execute('INSERT INTO feedback(ts, day, vid, rating, note, ask, answer) VALUES(?,?,?,?,?,?,?)',
-                  (time.time(), day(), vid, rating, redact(note, 500), redact(ask), redact(answer, 400)))
+                  (time.time(), day(), vid, rating, note, ask, answer))
         c.commit()
     if time.time() - _FBMD.get('t', 0) > 20:          # the log is rebuilt at most every 20 s (a flood can't burn the CPU); the weekly report reads the table
         _FBMD['t'] = time.time()
@@ -203,8 +257,8 @@ FEEDBACK_MD = DATA / 'feedback.md'
 def feedback_md():
     """Every 👍 / 👎 and Settings message as a readable log, newest on top, a heading per day — like Kivy's diary (2026-10-23).
     Rebuilt from the table each time, so it always matches it. Addresses are already hidden (redact). a reviewer summarises it weekly."""
-    with _lock:
-        rows = _db().execute('SELECT ts, day, rating, note, ask, answer FROM feedback ORDER BY ts DESC').fetchall()
+    with _reading() as c:
+        rows = c.execute('SELECT ts, day, rating, note, ask, answer FROM feedback ORDER BY ts DESC').fetchall()
     out, cur = ['# Kivy feedback — 👍 / 👎 under answers and Settings › Feedback (newest on top, times UTC)', ''], None
     one = lambda x, n: ' '.join(str(x or '').split())[:n]
     for ts, d, rating, note, ask, answer in rows:
@@ -261,6 +315,29 @@ def ptb(digest, address, status, kind, actions, verified, source='live', ts=None
 
 
 PIPE_FIELDS = ('kind', 'plan', 'sim', 'check1', 'sign', 'digest', 'chain', 'check2')
+# Caps (QA 2026-11-17 SRV-V2, fix package 5): rows had no cap and a field held whatever amount text the visitor sent (21.6 kB a row,
+# ~3.7 GB a day from one address). Now: new rows per day and per wallet per day, and a size cap per field (pipe_dump).
+PIPE_PER_DAY, PIPE_PER_WALLET_DAY = 20000, 200
+PIPE_FIELD_MAX, PIPE_TEXT_MAX = 4000, 60
+
+
+def _clip(v):
+    if isinstance(v, str):
+        return v[:PIPE_TEXT_MAX]
+    if isinstance(v, dict):
+        return {str(k)[:PIPE_TEXT_MAX]: _clip(x) for k, x in list(v.items())[:30]}
+    if isinstance(v, (list, tuple)):
+        return [_clip(x) for x in list(v)[:30]]
+    return v
+
+
+def pipe_dump(v):
+    """A field as stored: its JSON when short; else every text in it clipped; else only {"cut": true}."""
+    t = v if isinstance(v, str) else json.dumps(v)
+    if len(t) <= PIPE_FIELD_MAX:
+        return t
+    t = json.dumps(_clip(v)) if not isinstance(v, str) else v[:PIPE_FIELD_MAX]
+    return t if len(t) <= PIPE_FIELD_MAX else json.dumps({'cut': True})
 
 
 def pipe(iid, address=None, create=False, ts=None, **fields):
@@ -273,10 +350,15 @@ def pipe(iid, address=None, create=False, ts=None, **fields):
         c = _db()
         if create:
             t = ts or time.time()                    # ts: a backfilled transaction keeps its own time
-            c.execute('INSERT OR IGNORE INTO pipeline(iid, ts, day, wh) VALUES(?,?,?,?)', (iid, t, day(t), wh(address) if address else ''))
+            d, h = day(t), (wh(address) if address else '')
+            if not c.execute('SELECT 1 FROM pipeline WHERE iid = ?', (iid,)).fetchone():
+                if c.execute('SELECT COUNT(*) FROM pipeline WHERE day = ?', (d,)).fetchone()[0] >= PIPE_PER_DAY \
+                        or (h and c.execute('SELECT COUNT(*) FROM pipeline WHERE day = ? AND wh = ?', (d, h)).fetchone()[0] >= PIPE_PER_WALLET_DAY):
+                    return                           # the day's (or this wallet's) cap: the transaction still works, its stats row is skipped
+            c.execute('INSERT OR IGNORE INTO pipeline(iid, ts, day, wh) VALUES(?,?,?,?)', (iid, t, d, h))
         for k, v in fields.items():
             if k in PIPE_FIELDS and v is not None:
-                c.execute('UPDATE pipeline SET %s = ? WHERE iid = ?' % k, (v if isinstance(v, str) else json.dumps(v), iid))
+                c.execute('UPDATE pipeline SET %s = ? WHERE iid = ?' % k, (pipe_dump(v), iid))
         c.commit()
 
 
@@ -320,9 +402,9 @@ def _cohorts(c, table_first, table_days, key, weeks=8, F=''):
 
 
 def summary(days=30, exclude_team=False):
-    """Everything the dashboard shows. exclude_team: leave out our own browsers and wallets (team_v / team_w)."""
-    with _lock:
-        c = _db()
+    """Everything the dashboard shows. exclude_team: leave out our own browsers and wallets (team_v / team_w).
+    Read on its own connection: the stats writers (every chat's event) never wait for it (S7)."""
+    with _reading() as c:
         q = lambda sql, *a: c.execute(sql, a).fetchone()[0]
         since = day(time.time() - days * 86400)
         V = ' AND vid NOT IN (SELECT vid FROM team_v)' if exclude_team else ''        # visitor-keyed tables
@@ -440,8 +522,7 @@ def snapshot_today():
 def export_rows(what, exclude_team=False):
     """CSV rows for due diligence: 'ptbs' (every confirmed transaction id — check each on SuiVision), 'actions', 'daily', 'snapshots'."""
     W = ' AND p.wh NOT IN (SELECT wh FROM team_w)' if exclude_team else ''
-    with _lock:
-        c = _db()
+    with _reading() as c:
         if what == 'ptbs':
             head = ['day', 'utc_time', 'digest', 'explorer', 'status', 'kind', 'actions', 'money_moved_usd', 'gas_sui', 'source', 'team']
             rows = c.execute("SELECT p.day, strftime('%H:%M:%S', p.ts, 'unixepoch'), p.digest, 'https://suivision.xyz/txblock/' || p.digest, p.status, p.kind, "

@@ -6,13 +6,14 @@
 //   python3 export_records.py | node upload.mjs
 import fs from 'fs';
 import { MemWal } from '@mysten-incubation/memwal';
+// the key: systemd's credentials folder when the unit hands it in (root-only /opt/kivy/keys since 2026-11-14), else the data folder
 
 const ACCOUNT = '0x762470f60d8cb2b2dd88b68d2d2111d444050dc162e2272bb151cf18c8bd152e';
 const LEDGER = new URL('./ledger.jsonl', import.meta.url);
 const recs = JSON.parse(fs.readFileSync(0, 'utf8'));
 // the Walrus Memory client (@mysten-incubation/memwal) for Kivy's account, through the public relayer; its key is read
 // from Kivy's private data folder and never printed
-const m = MemWal.create({ key: fs.readFileSync('/opt/kivy/data/memwal.key', 'utf8').trim(), accountId: ACCOUNT,
+const m = MemWal.create({ key: fs.readFileSync([process.env.CREDENTIALS_DIRECTORY && process.env.CREDENTIALS_DIRECTORY + '/memwal.key', '/opt/kivy/data/memwal.key'].find((p) => p && fs.existsSync(p)) || '/opt/kivy/data/memwal.key', 'utf8').trim(), accountId: ACCOUNT,
   serverUrl: 'https://relayer.memory.walrus.xyz', namespace: 'kivy-rules' });
 
 let ok = 0, bad = 0;

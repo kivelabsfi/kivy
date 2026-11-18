@@ -31,7 +31,8 @@
   "Only these coins: {assets} — plus the coins Suilend and NAVI list (USDsui, vSUI, haSUI, sSUI, LBTC, suiWBTC, lzWBTC, BLUE, NAVX…); anything unlisted is refused",
   "Lending is supply only — never borrowing",
   "A swap is refused if slippage would pass {slippage}%",
-  "Sending to another address shows the full address first; you approve that one transfer in your wallet"
+  "Sending to another address shows the full address first; you approve that one transfer in your wallet",
+  "I only use a perps account whose key is in your wallet and that no other wallet can trade; if you have more than one, you pick it — I never pick for you"
  ],
  "help": "I can help with these:\n• swap: swap 5 SUI to USDC · swap all BTC to USDC\n• dust: swap all my dust to USDC — every coin under $0.01 in one approval, with what you get vs. the fees · sweep my dust then lend it on NAVI\n• rewards: claim my rewards — every market in one approval, with the rewards vs. the gas · claim my suilend rewards\n• send: send 1 USDC to name.sui (free for USDC) · send 1 SUI and 5 USDC to name.sui · send 1 USDC each to alice.sui and bob.sui · send all my USDC to my other wallet\n• lend: lend 10 USDC on NAVI · lend 1 SUI · withdraw all USDC from Suilend · change my vSUI to haSUI in NAVI\n• several steps, one approval: withdraw from aftermath then lend it on Suilend Ember (plus 5 USDC from my wallet) · take 1 USDC, swap half to SUI and half to DEEP, lend the SUI on NAVI and the DEEP on Suilend\n• perps: open BTC · open korean market · long SUI $10 5x · positions · deposit to perps\n• prices and balance: BTC price · price of BTC and ETH · how much USDC for 1 SUI · my total balance\n\nYour wallet signs every step — nothing moves without your yes.",
  "no_wallet": "No wallet connected yet. Press “Connect wallet” at the top. I can read your address and balances; to swap or send, your wallet will ask you to approve each transaction — I never hold your keys.",
@@ -145,7 +146,7 @@
     "my data",
     "privacy"
    ],
-   "answer": "I remember only what is public for your wallet: what you did through Kivy (read from the chain) and what you have lent right now — I rebuild it each time and don't store it. Your chats are saved only when you sign in with your wallet, and only you can open them. A sign-in lasts 7 days; Disconnect all in the wallet menu signs you out on every device. I never hold your keys."
+   "answer": "I remember only what is public for your wallet: what you did through Kivy (read from the chain) and what you have lent right now — I rebuild it each time and don't store it. Your chats are saved only when you sign in with your wallet, and only you can open them. A sign-in lasts 7 days; Disconnect all in the wallet menu signs you out on every device. When I prepare a transaction, I keep its full plan to check the result: 5 days if you don't sign it, 30 days if you do, then it is deleted. The internet address it came from is kept with it for 30 days to stop abuse, then deleted. I never hold your keys."
   },
   {
    "keys": [
@@ -176,6 +177,17 @@
     "limits of a plan"
    ],
    "answer": "One transaction takes one starting coin (your wallet, a withdrawal — the same coin from several markets, plus a top-up of it from your wallet — your perps margin, or your dust), up to 2 swaps, and up to 4 final steps: lend, send, keep or deposit to perps. A split can turn one coin into up to 4 coins, each lent on its own market or kept. If what you ask doesn't fit, I say which part and you can do it in two requests — I never build half of it."
+  },
+  {
+   "keys": [
+    "which perps account",
+    "perps accounts",
+    "agent wallet",
+    "assistant key",
+    "another wallet can trade",
+    "won t use my perps account"
+   ],
+   "answer": "A perps account's key can be sent to any wallet, and whoever sends it can keep an assistant key that still trades it. So I only use an account whose key is in your wallet and that no other wallet holds a key on. One that another wallet can trade shows as ⛔ and I never use it: remove the other key in Aftermath's app, or say \"open a new perps account\". If your wallet holds several usable accounts, or one with open orders or stop / TWAP orders on it, I show each one (margin, positions, orders) and you pick; every perps card then names the account (\"Account #1042\"). The pick lasts for this chat — I store nothing — and the app checks the account again before every transaction. Say \"my perps accounts\" to see them."
   }
  ],
  "coins": {

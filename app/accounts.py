@@ -35,10 +35,14 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.asymmetric import ec, ed25519, utils as ec_utils
 
 HOME = Path(__file__).resolve().parent
-DATA = HOME / 'data'
+from kivy.settings import DATA                      # noqa: E402  KIVY_DATA (2026-11-14)
+from kivy import limitstore as STORE                # noqa: E402  open sign-in challenges in limits.db when the service turned it on
 CHATS = DATA / 'chats'
-USER_COOKIE, USER_TTL = 'kivy_user', 7 * 24 * 3600
-LOGIN_COOKIE = 'kivy_login'                          # the browser that asked for a sign-in challenge (review W2-1)
+# __Host- names (2026-11-15, "go B"): the browser takes these cookies only from kivy.kivelabs.xyz itself (Secure, Path=/, no
+# Domain), so another *.kivelabs.xyz site can't plant a Kivy sign-in. The old names (kivy_user / kivy_login) are no longer read: a
+# browser signed in before the switch signs in again once.
+USER_COOKIE, USER_TTL = '__Host-kivy_user', 7 * 24 * 3600
+LOGIN_COOKIE = '__Host-kivy_login'                   # the browser that asked for a sign-in challenge (review W2-1)
 MAX_CHATS, MAX_TURNS, MAX_CHAT_BYTES = 40, 200, 150_000
 ID_RE = re.compile(r'^[A-Za-z0-9_-]{1,40}$')
 _lock = threading.Lock()
@@ -178,7 +182,7 @@ def _clean(chat):
     for t in (chat.get('turns') or [])[-MAX_TURNS:]:
         turns.append({'u': str(t.get('u') or '')[:4000], 't': str(t.get('t') or '')[:8000],
                       'ts': int(t.get('ts') or 0) if str(t.get('ts') or '0').isdigit() else 0,
-                      'p': t.get('p') if isinstance(t.get('p'), dict) else None})
+                      'p': t.get('p') if isinstance(t.get('p'), dict) else None, **({'a': 1} if t.get('a') else {})})   # a: Kivy's own next step (2026-11-13)
     out = {'id': cid, 'title': str(chat.get('title') or '')[:80], 'turns': turns,
            'ts': int(chat.get('ts') or time.time() * 1000)}
     if len(json.dumps(out)) > MAX_CHAT_BYTES:
@@ -228,7 +232,8 @@ def delete_chat(email, cid):
 # ── wallet sign-in ──
 ADDR = re.compile(r'^0x[0-9a-f]{64}$')
 GRAPHQL = 'https://graphql.mainnet.sui.io/graphql'
-_pending = {}            # nonce -> (address, message, expires, visitor ip or None)
+SHADOW_HOOK = None                                    # server.py's start-up block sets it (chain gateway shadow mode, 2026-11-12)
+_pending = {}            # nonce -> (address, message, expires, visitor ip or None, browser binding hash) — store off/failing only
 _plock = threading.Lock()  # guards _pending: concurrent sign-ins crashed iterating it (review 2026-11-04 S-2)
 PENDING_PER_IP = 20      # open sign-ins one visitor address may hold at once (W-6)
 
@@ -289,14 +294,30 @@ def agreed(address):
     return r[0] if r and r[0] else None
 
 
-# /api/auth/challenge: a one-time message for the wallet to sign (valid 10 minutes, kept in memory only, so a
-# kivy-site restart cancels open sign-ins). It includes the Terms when they are switched on.
+# /api/auth/challenge: a one-time message for the wallet to sign (valid 10 minutes, used once, only in the browser that asked).
+# Kept in limits.db by the running service (kivy/limitstore.py, 2026-11-14), so a restart no longer cancels open sign-ins; in
+# memory when the store is off (tests, tools) or failing. It includes the Terms when they are switched on.
 def challenge(address, ip=None, bind=None):
     address = str(address or '').lower()
     if not ADDR.match(address):
         raise ValueError('bad address')
+    now = time.time()
+    nonce = secrets.token_hex(12)
+    msg = _challenge_text(address, nonce, now)
+    bh = hashlib.sha256(bind.encode()).hexdigest() if bind else None
+    put = STORE.challenge_put(nonce, address, msg, now + 600, ip, bh, now, 4, PENDING_PER_IP, 5000) if STORE.ON else None
+    if put == 'busy':
+        raise ValueError('busy, try again in a minute')
+    if put is None:                                         # store off or failing: in memory, as before
+        _challenge_mem(address, ip, now)
+        with _plock:
+            _pending[nonce] = (address, msg, now + 600, ip, bh)
+    return msg
+
+
+def _challenge_mem(address, ip, now):
+    """The in-memory caps before a new challenge (the same ones limitstore.challenge_put applies)."""
     with _plock:
-        now = time.time()
         for k in [k for k, v in _pending.items() if v[2] < now]:
             _pending.pop(k, None)
         src = lambda v: v[3] if len(v) > 3 else None
@@ -311,7 +332,9 @@ def challenge(address, ip=None, bind=None):
                 held[src(v)] = held.get(src(v), 0) + 1
             top = max(held, key=held.get)
             _pending.pop(min((v[2], k) for k, v in _pending.items() if src(v) == top)[1], None)
-    nonce = secrets.token_hex(12)
+
+
+def _challenge_text(address, nonce, now):
     if terms_on():
         msg = ("Sign in to Kivy\n\nI agree to Kivy's Terms of Service (%s) and Privacy Policy: %s\n\n"
                'This proves you own this wallet. It is not a transaction and costs nothing.\n\nSite: %s (do not sign this anywhere else)\nAddress: %s\nNonce: %s\nIssued: %s UTC'
@@ -320,8 +343,6 @@ def challenge(address, ip=None, bind=None):
         msg = ('Sign in to Kivy\n\nThis only proves you own this wallet so your chats stay private. '
                'It is not a transaction and costs nothing.\n\nSite: %s (do not sign this anywhere else)\nAddress: %s\nNonce: %s\nIssued: %s UTC'
                % (SITE_HOST, address, nonce, time.strftime('%Y-%m-%d %H:%M', time.gmtime(now))))
-    with _plock:
-        _pending[nonce] = (address, msg, now + 600, ip, hashlib.sha256(bind.encode()).hexdigest() if bind else None)
     return msg
 
 
@@ -366,7 +387,13 @@ def verify_personal(address, msg_bytes, sig_b64):
     body = json.dumps({'query': q, 'variables': {'m': base64.b64encode(msg_bytes).decode(), 's': sig_b64, 'a': address}}).encode()
     req = urllib.request.Request(GRAPHQL, data=body, headers={'Content-Type': 'application/json', 'User-Agent': 'kivy/1'})
     out = json.load(urllib.request.urlopen(req, timeout=20))
-    return bool(((out.get('data') or {}).get('verifySignature') or {}).get('success'))
+    ok = bool(((out.get('data') or {}).get('verifySignature') or {}).get('success'))
+    if SHADOW_HOOK:                                    # chain gateway shadow mode (server.py sets it): compares, never decides
+        try:
+            SHADOW_HOOK(address, base64.b64encode(msg_bytes).decode(), sig_b64, ok)
+        except Exception:
+            pass
+    return ok
 
 
 # /api/auth/wallet: the nonce must be one challenge() issued for this address, unused and unexpired; then the signature
@@ -376,10 +403,15 @@ def sign_in_wallet(address, message, sig_b64, bind=None):
     address = str(address or '').lower()
     m = re.search(r'Nonce: ([0-9a-f]{24})', str(message or ''))
     with _plock:
-        hit = _pending.pop(m.group(1), None) if m else None
-    if not hit or hit[0] != address or hit[1] != message or hit[2] < time.time():
+        hit = _pending.pop(m.group(1), None) if m else None   # used up by the first try, right or wrong
+    if hit:
+        same, exp, want = hit[0] == address and hit[1] == message, hit[2], (hit[4] if len(hit) > 4 else None)
+    else:                                               # limits.db: read and deleted in one statement (single use across workers)
+        row = STORE.challenge_take(m.group(1), address, message) if m and STORE.ON else None
+        same, exp, want = row if row else (False, 0, None)
+    if not same or exp < time.time():
         raise ValueError('sign-in expired, try again')
-    want = hit[4] if len(hit) > 4 else None            # a reviewer W2-1: a challenge bound to a browser only signs in that browser
+    # a reviewer W2-1: a challenge bound to a browser only signs in that browser (want = the binding hash)
     if want and not hmac.compare_digest(want, hashlib.sha256(str(bind or '').encode()).hexdigest()):
         raise ValueError('start the sign-in again in this browser')
     if not verify_personal(address, message.encode(), str(sig_b64 or '')):

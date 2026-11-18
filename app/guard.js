@@ -1,12 +1,18 @@
-// Kivy check 1 — runs in the user's browser right before the wallet opens (copied unchanged from the live page).
-// It simulates the exact transaction on Sui and refuses it unless what would happen matches the card the user
-// approved: allowlisted programs only, no publish/upgrade, no more of the user's coins out than approved, at least
-// the promised amount in, exact amounts to recipients, at most 1% of the user's coins to anyone else (route-only
-// coins only in a pure aggregator swap), no object of the user leaving the wallet, account-balance spends bounded.
-// From the page around it: gqlUrl(NET) / NET (the Sui GraphQL endpoint), pipe() (reports to Kivy's stats, never
-// blocks), /vendor/sui-2.36.0.js (Mysten's Sui TypeScript SDK) and #kivy-pkgs (app/kivy_pkgs.json put into the page).
-// The server re-checks the landed transaction against the plan as check 2 (app/server.py, check_tx).
+// Kivy check 1 — runs in the user's browser right before the wallet opens (copied unchanged from the live site,
+// site/src/check1.js). It simulates the exact transaction on Sui and refuses it unless what would happen matches the card
+// the user approved; the page calls makeCheck1(document, gqlUrl, NET, pipe). The server re-checks the landed transaction
+// against the plan as check 2 (app/kivy/check2.py, check_tx). The rules it reads come from app/kivy_pkgs.json.
 
+// Kivy check 1 — runs in the user's browser right before the wallet opens. It simulates the exact transaction on Sui and
+// refuses it unless what would happen matches the card the user approved (the server's guard): allowlisted programs only,
+// the call rules, no publish/upgrade, no more of the user's coins out than approved, at least the promised amount in, exact
+// amounts to recipients, route-only coins only in a pure aggregator swap, no object of the user leaving the wallet,
+// account-balance spends bounded, the rules version the page loaded.
+// How it runs: its own ES module since 2026-11-14 (architecture programme change 7). The page's wallet module imports
+// makeCheck1() and tools/build_page.py bundles it into /app/kivy-<n>.<hash>.js; tests import this file directly.
+// makeCheck1(document, gqlUrl, NET, pipe): the four things it takes from the page — the DOM (the #kivy-pkgs, #kivy-calls and
+// #kivy-policy data blocks), the Sui GraphQL address for a network, the network, and the stats reporter (never blocks).
+export function makeCheck1(document, gqlUrl, NET, pipe) {
 // Audit T11: before the wallet opens, simulate the FINAL transaction and compare what it does to this wallet
 // with what the user approved (the server's `guard`). Simulation success alone is not enough.
 function normAddr(a) { try { return '0x' + BigInt(a).toString(16).padStart(64, '0'); } catch (e) { return String(a).toLowerCase(); } }
@@ -22,22 +28,76 @@ var KIVY_PKGS = (function () {                      // the allowlist: the server
   var el = document.getElementById('kivy-pkgs'); try { if (el) return JSON.parse(el.textContent); } catch (e) {}
   return [];                                      // no block: nothing is allowlisted, every call is refused (was a stale copy; a reviewer 2026-11-04 S2)
 })().map(normAddr);
+// Call rules (the owner "Go" 2026-11-13, after a defensive review found check 1 looked only at WHICH PACKAGES a transaction calls):
+// each kind of plan step may call only the functions it needs — a lend plan can't call deposit_ctokens_into_obligation_by_id
+// (someone else's account) or repay, a swap plan can't call lending at all. One table, kivy_pkgs.json "calls", which the server
+// puts in #kivy-calls; the guard names the plan's steps (g.steps). The server (call_watch) and the builder enforce the same
+// table. No table: every call outside the framework is refused (fails closed, as KIVY_PKGS does).
+var KIVY_CALLS = (function () {
+  var el = document.getElementById('kivy-calls');
+  try { if (el) { var c = JSON.parse(el.textContent); if (c && c.steps) return c; } } catch (e) {}
+  return {};
+})();
+// Shared values: kivy_pkgs.json calls.consts is their ONLY copy — this page, the server and the builder read it (architecture
+// programme change 5, 2026-11-14; they were typed by hand in all three). A missing value makes check 1 stricter, and a guard
+// without the table is refused below.
+var KIVY_CONSTS = KIVY_CALLS.consts || {};
 // swap routers' own fee wallets (Aftermath; Cetus pays none for Kivy's routes): the ONLY addresses a coin the plan
 // never mentions may go to during a swap (audit nv #1 — any address used to pass, so a route could drain lent positions)
-var ROUTER_FEE_WALLETS = ['0x1fb0c0a6790860fc83c8f26f6fa089868ad94de9468348f98dfb4cdf89a53777'];
+var ROUTER_FEE_WALLETS = (KIVY_CONSTS.route_fee_wallets || []).map(normAddr);
 // the swap aggregators' entry programs (Aftermath router, Cetus aggregator v3). 2026-10-28: a hop inside their
 // route is trusted wherever it goes — a coin only the route touches may go to any address (a pool's fee wallet); the user's own
 // coins keep the 1% limit and every "you must receive" check below
-var AGG_PKGS = ['0x7de5de8d75a8f4e42cdd3c018f788bc9b9ebf2d3d61dcfe9d2136f17f077afd5', '0xffd4058af7d6f6d66c335930cced8c91e38ec943e2392232aee27e8127e684e9'].map(normAddr);
+var AGG_PKGS = (KIVY_CONSTS.aggregator_entry || []).map(normAddr);
 // Aftermath perps (allowlisted): only a perps plan may call it — the server marks its guard `perps`. An order slipped into a swap
 // moves no coin and no object, so no other rule here would see it (review K-4, 2026-10-30; the server's check 2 refuses it too)
-var PERPS_PKGS = ['0x3ec740df8428aa9c93aaef7f8cc1542ac3194fd014826b51bfe245346d64efc7'].map(normAddr);
+var PERPS_PKGS = (KIVY_CONSTS.perps_programs || []).map(normAddr);
+// a step that takes value out of a protocol (withdraw, redeem, claim, perps collateral …): never part of a pure swap
+var PULLS_VALUE = (function () { try { return KIVY_CONSTS.pulls_value ? new RegExp(KIVY_CONSTS.pulls_value, 'i') : /./; } catch (e) { return /./; } })();
+// the version of the rules this page loaded (#kivy-policy); every guard names the version that judged its plan
+var KIVY_POLICY = (function () { var el = document.getElementById('kivy-policy'); try { return el ? String(JSON.parse(el.textContent)) : ''; } catch (e) { return ''; } })();
+var CALL_NEVER = (function () {                  // refused in every plan; a rule that can't be read refuses every call
+  try { return KIVY_CALLS.never ? new RegExp(KIVY_CALLS.never, 'i') : null; } catch (e) { return new RegExp(''); }
+})();
+// a listed package's group: 'fw' (0x1, 0x2) or one of KIVY_CALLS.groups (swap, lend, oracle, perps). In no group: '' — no group
+// rule fits it, so every call of it is refused (default deny, a reviewer scan 2026-11-15; it used to count as a swap program)
+function callGroup(pkg) {
+  if (pkg === normAddr('0x1') || pkg === normAddr('0x2')) return 'fw';
+  var gs = KIVY_CALLS.groups || {}, hit = '';
+  Object.keys(gs).forEach(function (k) { if ((gs[k] || []).map(normAddr).indexOf(pkg) >= 0) hit = k; });
+  return hit;
+}
+// one rule ('<group or 0x-address>::<module>::<function>', '*' = any, a trailing '*' = starts with) against one call
+function callRule(r, c, grp) {
+  var p = String(r).split('::');
+  var part = function (want, got) { return want === '*' || want === got || (want.slice(-1) === '*' && got.indexOf(want.slice(0, -1)) === 0); };
+  return p.length === 3 && (p[0].slice(0, 2) === '0x' ? normAddr(p[0]) === c.pkg : p[0] === grp) && part(p[1], c.mod) && part(p[2], c.fn);
+}
+// why a call (of a listed package) does not belong in a plan with these steps; '' = it does
+function callWhy(c, steps) {
+  var grp = callGroup(c.pkg), rules = (KIVY_CALLS.fw || []).slice();
+  if (CALL_NEVER && CALL_NEVER.test(c.fn)) return 'it calls ' + c.mod + '::' + c.fn + ', which no Kivy plan may call';
+  (steps || []).forEach(function (s) { rules = rules.concat(((KIVY_CALLS.steps || {})[s]) || []); });
+  return rules.some(function (r) { return callRule(r, c, grp); }) ? '' : 'it calls ' + c.mod + '::' + c.fn + ', which this plan does not need';
+}
+// the user's lending keys (a Suilend account's ObligationOwnerCap, NAVI's AccountCap and vault Receipt) and perps key: used only by
+// a plan with a step that needs them (KIVY_CALLS.caps) — a swap or a send never touches them; '' = fine
+function capWhy(ty, steps) {
+  var m = /^0x[0-9a-fA-F]+::(\w+::\w+)(?:<|$)/.exec(String(ty)), caps = KIVY_CALLS.caps || {};
+  if (!m || !caps[m[1]]) return '';
+  return caps[m[1]].some(function (s) { return (steps || []).indexOf(s) >= 0; }) ? '' : 'it would use your ' + m[1].split('::')[1] + ', which this plan does not need';
+}
 // json: the transaction as the wallet will get it; g: the server's guard (out / in / vol / pay / gas / fee);
 // addr: the signer. Resolves with the balance changes (for pipe), rejects with the reason the card shows.
 // Called by sign() in kivyAct1.
 function checkIntent(json, g, addr) {
   if (!g) return Promise.reject(new Error('Kivy could not check this transaction, so it was not sent.'));
-  var calls = [], reserve = {}, odd = false, budget = null;
+  // the rules version covers the rules table, this file and the libraries' checksums (kivy/policy.py policy_version). A guard
+  // judged by another version, a guard with NO version, or a page that has none itself is refused — it passed before
+  // (2026-11-15, a reviewer scan page findings 10 and V12: `g.policy && …` let a guard without a version through)
+  if (!KIVY_CALLS.consts || !KIVY_POLICY || !g.policy || g.policy !== KIVY_POLICY)   // rules changed since this page loaded, or unreadable (change 5)
+    return Promise.reject(new Error('Kivy\'s safety rules were updated after this page loaded. Reload the page and ask again — nothing was signed.'));
+  var calls = [], reserve = {}, odd = false, budget = null, gasOwner = null;
   return import('/vendor/sui-2.36.0.js').then(function (s) { return [s, s]; }).then(function (m) {
     var client = new m[1].SuiGraphQLClient({url: gqlUrl(NET), network: NET});
     var tx = m[0].Transaction.from(json);
@@ -53,6 +113,7 @@ function checkIntent(json, g, addr) {
     });
     var gd = tx.getData().gasData || {};
     if (gd.budget != null && gd.budget !== '') budget = BigInt(gd.budget);   // the transaction's own gas limit (L1)
+    gasOwner = gd.owner || null;                     // who pays the network fee (none set: the signer)
     var cmds0 = tx.getData().commands || [];
     if (cmds0.some(function (c) { return c.Publish || c.Upgrade || c.$kind === 'Publish' || c.$kind === 'Upgrade'; }))   // audit nv #2
       throw new Error('Kivy stopped this transaction: it would publish or upgrade a program. Nothing was signed.');
@@ -91,18 +152,20 @@ function checkIntent(json, g, addr) {
       pipe(g, 'pkg_unlisted', {pkgs: ['FundsWithdrawal: unreadable reservation']});
       bad.push('it takes from your account balance in a way Kivy cannot read');
     }
-    var swapping = calls.some(function (c) { return c.mod === 'router' && KIVY_PKGS.indexOf(c.pkg) >= 0; });   // Aftermath's own (allowlisted) router, not any module named 'router' (S-01)
+    var swapping = !!g.swap && calls.some(function (c) { return c.mod === 'router' && KIVY_PKGS.indexOf(c.pkg) >= 0; });   // Aftermath's own (allowlisted) router, not any module named 'router' (S-01); only in a plan with a swap step (2026-11-13)
     calls.forEach(function (c) {
       if (KIVY_PKGS.indexOf(c.pkg) >= 0) return;
       warn.push(c.pkg + '::' + c.mod);                 // reported for vetting, and refused: no exemption for a module's NAME (review H1)
       bad.push('it calls a program Kivy has not verified (' + c.pkg.slice(0, 10) + '…::' + c.mod + ')');
     });
     if (!g.perps && calls.some(function (c) { return PERPS_PKGS.indexOf(c.pkg) >= 0; })) bad.push('it calls the perps program, which this plan does not use');
+    var steps = Array.isArray(g.steps) ? g.steps : [];   // the plan's kinds of step (server: plan_steps); none named = framework helpers only
+    calls.forEach(function (c) { if (KIVY_PKGS.indexOf(c.pkg) >= 0) { var why = callWhy(c, steps); if (why) bad.push(why); } });
     // pure aggregator swap: an aggregator is called and nothing outside a router pulls value out of a protocol (no lending
     // withdraw / redeem / borrow / claim, no perps collateral withdraw) — else a route-only coin keeps the strict rule
     var FW = [normAddr('0x1'), normAddr('0x2')];
-    var pureAggSwap = calls.some(function (c) { return AGG_PKGS.indexOf(c.pkg) >= 0; }) &&
-      !calls.some(function (c) { return FW.indexOf(c.pkg) < 0 && /withdraw|redeem|borrow|claim|collateral|unstake|liquidat/i.test(c.fn); });   // any module (H1)
+    var pureAggSwap = !!g.swap && calls.some(function (c) { return AGG_PKGS.indexOf(c.pkg) >= 0; }) &&   // a plan with a swap step only (zero-day review C)
+      !calls.some(function (c) { return FW.indexOf(c.pkg) < 0 && PULLS_VALUE.test(c.fn); });   // any module (H1); the pattern: calls.consts.pulls_value
     (t.balanceChanges || []).forEach(function (c) {
       var who = normAddr(c.address), ty = normType(c.coinType), v = BigInt(c.amount);
       if (who === me) {
@@ -118,6 +181,12 @@ function checkIntent(json, g, addr) {
         if (-v > (out[ty] || 0n)) bad.push('it would take ' + (-v).toString() + ' units of ' + ty.split('::').pop() + (out[ty] ? ' (approved ' + out[ty].toString() + ')' : ', which you did not approve'));
       } else if (v > 0n) credit[who + '|' + ty] = (credit[who + '|' + ty] || 0n) + v;
     });
+    // no balance list is not "nothing moved" (zero-day review D, 2026-11-13): when the signer pays a network fee, the simulation
+    // must show the signer's SUI moving — otherwise Kivy can't tell what this transaction does
+    var feeRaw = gu ? BigInt(gu.computationCost || 0) + BigInt(gu.storageCost || 0) - BigInt(gu.storageRebate || 0) : null;
+    if ((!gasOwner || normAddr(gasOwner) === me) && feeRaw !== 0n &&
+        !(t.balanceChanges || []).some(function (c) { return normAddr(c.address) === me && normType(c.coinType) === SUI; }))
+      throw new Error('Kivy could not check this transaction, so it was not sent.');
     Object.keys(inn).forEach(function (ty) { if ((ty === SUI ? suiNet + gasNet + feeBack : (got[ty] || 0n)) < inn[ty]) bad.push('you would not receive the ' + ty.split('::').pop() + ' this should pay you'); });
     Object.keys(need).forEach(function (k) { if ((credit[k] || 0n) < need[k]) bad.push('the recipient would not get the ' + k.split('::').pop() + ' you approved'); });
     var payee = {}; pays.forEach(function (p) { payee[normAddr(p.address)] = 1; });
@@ -134,6 +203,8 @@ function checkIntent(json, g, addr) {
     var types = s.objectTypes || t.objectTypes || {};
     ((t.effects || {}).changedObjects || []).forEach(function (o) {
       var was = ownerAddr(o.inputOwner), now = ownerAddr(o.outputOwner), ty = String(types[o.objectId] || '');
+      var cw = was && normAddr(was) === me ? capWhy(ty, steps) : '';   // your lending / perps key in a plan that doesn't need it (2026-11-13)
+      if (cw) bad.push(cw);
       if (was && normAddr(was) === me && now && normAddr(now) !== me) bad.push('it would hand one of your objects to another address');
       // one of your objects that is not a coin may not leave your wallet in any other way either: wrapped, deleted, put under
       // another object or shared (audit nv #3 — only transfers to an address were caught). Coins merge and split all the time.
@@ -142,9 +213,15 @@ function checkIntent(json, g, addr) {
       else if (!was && now && normAddr(now) !== me && !/^0x0*2::coin::Coin</.test(ty)) bad.push('it would create something (' + (ty.split('::').slice(-2).join('::') || 'an object') + ') for another address');
       // a coin of yours, or a new coin, made shared or frozen is out of your hands too — anyone may take a shared coin (review M1)
       else if (ownerShared(o.outputOwner) && /^0x0*2::coin::Coin</.test(ty) && (was ? normAddr(was) === me : !o.inputOwner)) bad.push('it would put a coin where anyone can take it (shared)');
+      // any other object that already existed and was not shared — another object's child, a wrapped one, someone's — may not
+      // end up shared or frozen either (zero-day review E, 2026-11-13). A NEW object may be shared (a new perps account is).
+      else if (ownerShared(o.outputOwner) && !/^0x0*2::coin::Coin</.test(ty) && !ownerShared(o.inputOwner) && o.idOperation !== 'Created')
+        bad.push('it would make an object (' + (ty.split('::').slice(-2).join('::') || 'an object') + ') shared or frozen');
     });
     if (warn.length) pipe(g, 'pkg_unlisted', {pkgs: warn.slice(0, 5)});
     if (bad.length) throw new Error('Kivy stopped this transaction: ' + bad[0] + '. Nothing was signed.');
     return (t.balanceChanges || []).slice(0, 12).map(function (c) { return {a: normAddr(c.address), t: c.coinType, v: String(c.amount)}; });   // for the stats pipeline
   });
+}
+  return { normAddr, normType, ownerAddr, ownerShared, KIVY_PKGS, KIVY_CALLS, KIVY_CONSTS, ROUTER_FEE_WALLETS, AGG_PKGS, PERPS_PKGS, PULLS_VALUE, KIVY_POLICY, CALL_NEVER, callGroup, callRule, callWhy, capWhy, checkIntent };
 }

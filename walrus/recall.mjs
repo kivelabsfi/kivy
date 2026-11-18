@@ -4,7 +4,8 @@
 // Search Kivy's security records on Walrus Memory.   KIVY_WAL_NS=wallet-<hash> node recall.mjs "failed check 2" [topK]
 import fs from 'fs';
 import { MemWal } from '@mysten-incubation/memwal';
-const m = MemWal.create({ key: fs.readFileSync('/opt/kivy/data/memwal.key', 'utf8').trim(),
+// the key: systemd's credentials folder when the unit hands it in (root-only /opt/kivy/keys since 2026-11-14), else the data folder
+const m = MemWal.create({ key: fs.readFileSync([process.env.CREDENTIALS_DIRECTORY && process.env.CREDENTIALS_DIRECTORY + '/memwal.key', '/opt/kivy/keys/memwal.key', '/opt/kivy/data/memwal.key'].find((p) => p && fs.existsSync(p)) || '/opt/kivy/data/memwal.key', 'utf8').trim(),
   accountId: '0x762470f60d8cb2b2dd88b68d2d2111d444050dc162e2272bb151cf18c8bd152e',
   serverUrl: 'https://relayer.memory.walrus.xyz', namespace: process.env.KIVY_WAL_NS || 'kivy-rules' });
 // semantic search: the top K records closest to the query (distance 0 = same meaning; above 0.9 is dropped)
